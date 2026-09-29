@@ -33,7 +33,7 @@ begin_rebuild(id, chunk_drafts, *, expected_content) -> tuple[Chunk]
 - [x] 恢复快照与切片 ID 复用：仅当正文和当前切片参数的结果完全一致时保留 ID（PR #49、#54）。
 - [x] 单独测试本模块，无 Chroma、模型和 FastAPI 依赖；模块 import 约束通过。
 
-实现 PR：[输入 #40](https://github.com/vansye/EasyRAG/pull/40)、[接管 #42](https://github.com/vansye/EasyRAG/pull/42)、[CRUD #43](https://github.com/vansye/EasyRAG/pull/43)、[恢复 #49](https://github.com/vansye/EasyRAG/pull/49)。本次接管本机数据的实际结果另见 [切换记录](fastapi-cutover.md)，不以隔离测试代替实际迁移结果。
+实现 PR：[输入 #40](https://github.com/vansye/EasyRAG/pull/40)、[接管 #42](https://github.com/vansye/EasyRAG/pull/42)、[CRUD #43](https://github.com/vansye/EasyRAG/pull/43)、[恢复 #49](https://github.com/vansye/EasyRAG/pull/49)。本次接管本机数据的实际结果另见 [切换记录](../README.md)，不以隔离测试代替实际迁移结果。
 
 ### 当前切片持久化契约（2026-09-15 修订）
 

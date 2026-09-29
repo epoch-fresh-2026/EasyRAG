@@ -4,7 +4,7 @@
 
 ## 架构
 
-后端统一为一个 FastAPI 进程（8080），前端保持 Vue 3 + TypeScript + Pinia + Vite（5173）。MySQL 8 保存资料、切片与问答历史，Chroma 保存可重建的派生向量。无需 Java 或独立的内部 RAG HTTP 服务。
+后端为一个 FastAPI 进程（8080），前端使用 Vue 3 + TypeScript + Pinia + Vite。MySQL 8 保存资料、切片与问答历史，Chroma 保存可重建的派生向量，BM25 从索引载荷构建。构建后的前端由 FastAPI 同源托管；开发时可使用 Vite 5173。
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ A/B/C/F 互不引用。G 只调用各模块的 `public.py`，通过注入接口�
 - 历史：G 直接调用 A 查询或删除独立记录；不调用检索和回答模型，不把历史答案加入索引或后续提问上下文。
 - 更新/删除：变更许可覆盖撤旧向量和数据库变更，直到异步索引终态；无法确认一致时关闭问答，要求显式恢复。
 
-完整边界、设计取舍与迁移记录见 [模块设计](docs/fastapi-modules.md)、[架构设计](docs/架构设计.md)。检索默认为混合策略：向量与 BM25 各取前 20 个候选做倒数排名融合，词法索引由 Chroma 载荷派生、随每次写入重建（`RETRIEVAL_STRATEGY=dense` 可退回纯向量）；之后仍是一次检索后的三态判定。查询改写重查、URL 抓取属于后续范围。
+完整边界与设计取舍见 [架构设计](docs/架构设计.md)。检索默认为混合策略：向量与 BM25 各取前 20 个候选做倒数排名融合，词法索引由 Chroma 载荷派生、随每次写入重建（`RETRIEVAL_STRATEGY=dense` 可退回纯向量）；之后仍是一次检索后的三态判定。资料正文中的链接可在预览页点击打开，系统不抓取外部网页。查询改写重查尚未实现。
 
 ## 目录
 
@@ -72,7 +72,7 @@ cd ..\rag-service
 打开 `http://127.0.0.1:8080/`，点击「确认就绪」。后端启动时是 `RECOVERY_REQUIRED`；只有资料/切片/向量完整一致才开放问答，并重新提交 PENDING。
 
 启动时后端会：
-- 在库不存在时创建数据库（utf8mb4），空库建表，已有库升级到当前结构；数据库用户需要相应权限。旧版 Java/Flyway V2 数据库不会被自动改动，需停服后先运行 `python -m app.maintenance adopt-legacy-db`（流程见 [切换与回退](docs/fastapi-cutover.md)）。
+- 在库不存在时创建数据库（utf8mb4），空库建表，已有库升级到当前结构；数据库用户需要相应权限。旧版 Java/Flyway V2 数据库不会被自动改动，需停服后先运行 `python -m app.maintenance adopt-legacy-db`（见下方维护与故障恢复）。
 - 在默认 tokenizer 文件缺失时，从 Hugging Face 按固定版本下载（约 17 MB）；网络受限时可设置 `HF_ENDPOINT` 使用镜像。
 - 在 `frontend/dist` 存在时直接托管前端页面；开发前端时可另开终端运行 `npm run dev -- --host 127.0.0.1 --port 5173`，Vite 把 `/api` 与 `/health` 代理到 8080。页面和交互说明见 [前端 README](frontend/README.md)。
 
@@ -86,13 +86,13 @@ Windows 下 `CHROMA_DIR` 必须是纯 ASCII 路径（默认值在项目目录下
 
 每个问题固定一个会话；配置修改从下一次问题生效，切换回答模型不重建向量。「恢复启动配置」移除本机覆盖文件，重新读取环境变量 / `.env`。启动配置使用 `LLM_PROVIDER`、`LLM_MODEL`、`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_TIMEOUT_SECONDS`，示例见 [.env.example](rag-service/.env.example)。
 
-后端在开始接收请求前准备本地 SDK 依赖，不要求配置回答模型，也不发送生成预热。导入失败会记录安全告警，配置和资料管理仍可使用。此步骤把首次 SDK 导入等待移到启动阶段；客户端仍按每问配置构造。可在 `rag-service` 执行 `python scripts/benchmark_sdk_preparation.py --samples 3 --output data/sdk-preparation.json` 重测独立进程中的准备、首会话及热会话耗时；脚本使用临时目录和合成配置，并阻止网络访问。结果口径见 [M4 进度](docs/m4-progress-2026-09-16.md)。
+后端在开始接收请求前准备本地 SDK 依赖，不要求配置回答模型，也不发送生成预热。导入失败会记录安全告警，配置和资料管理仍可使用。此步骤把首次 SDK 导入等待移到启动阶段；客户端仍按每问配置构造。可在 `rag-service` 执行 `python scripts/benchmark_sdk_preparation.py --samples 3 --output data/sdk-preparation.json` 重测独立进程中的准备、首会话及热会话耗时；脚本使用临时目录和合成配置，并阻止网络访问。该测量只比较独立进程的本地 SDK 准备成本，不代表模型网络或生成延迟。
 
 ## 问答历史
 
 网页提问使用流式接口：生成中先显示纯文本预览，完整引用校验与历史提交成功后显示正式答案和出处。连接中断或生成失败会标记未完成；不自动重试。若在提交期间断连，记录可能已经保存，请先查看历史再决定是否重问。原 JSON 问答接口继续可用，事件、取消与计时边界见 [API 文档](docs/api.md#流式问答)。
 
-流式交付、分层审查和验证记录见 [M4 流式交付](docs/m4-streaming-delivery-2026-09-20.md)。浏览器展示的首字耗时测到接收首段文本，不等同于模型推理耗时或屏幕绘制时间。
+浏览器展示的首字耗时测到接收首段文本，不等同于模型推理耗时或屏幕绘制时间。
 
 知识问答页可分页查看历史、打开保存的回答与来源全文、删除单条记录或重新提问。每次完成的回答、部分回答和拒答都保存一条记录，包含原问题、正文、状态、时间、实际模型、耗时和检索过程；重新提问使用当前资料与模型，生成另一条记录。
 
@@ -100,7 +100,9 @@ Windows 下 `CHROMA_DIR` 必须是纯 ASCII 路径（默认值在项目目录下
 
 ## 维护与故障恢复
 
-停止后端后，在同一目录、同一配置下执行：
+维护前停止后端及其他写入者，确认进程退出；对 MySQL 做完整逻辑备份，并成套保存 `.env`、回答模型配置及 `CHROMA_DIR`。备份需放在仓库外，记录对应代码版本与依赖配置。不要在写入期间直接复制索引目录。
+
+在 `rag-service` 中，使用后端相同的数据库、索引目录和进程锁配置执行以下所需命令（不是依次全部运行）：
 
 ```powershell
 # 仅尚未接管的 Java/Flyway V2 数据库执行：
@@ -111,7 +113,7 @@ Windows 下 `CHROMA_DIR` 必须是纯 ASCII 路径（默认值在项目目录下
 .\.venv\Scripts\python.exe -m app.maintenance rebuild-index
 ```
 
-接管只用于支持的旧库；重建用于缺失/多余/过时向量、遗留 INDEXING 或切片/embedding 配置改变，也用于索引无法加载（`/health` 的 `chroma.error` 为 `InternalError`，例如曾在非 ASCII 路径下持久化）。重建保留能证明与当前正文和切片参数完全匹配的 ID，否则重新切片。失败返回非零退出码，重新启动也不会自动放行。没有公开 `/reset`、`/embed`、`/chunk` 等内部操作接口。
+接管只用于支持的旧库；重建用于缺失/多余/过时向量、遗留 INDEXING 或切片/embedding 配置改变，也用于索引无法加载（`/health` 的 `chroma.error` 为 `InternalError`，例如曾在非 ASCII 路径下持久化）。重建保留能证明与当前正文和切片参数完全匹配的 ID，否则重新切片。失败返回非零退出码，重新启动也不会自动放行。旧库接管仅接受能通过真实 schema 核验的 Flyway V2 库；未知非空库不会自动覆盖。维护成功后启动后端，检查 `/health` 各依赖，并手动「确认就绪」。失败时保持停写，按错误修复后重试；若必须恢复备份，应在停服状态恢复同一批数据库、索引与配置，仍须通过就绪核验。没有公开 `/reset`、`/embed`、`/chunk` 等内部操作接口。
 
 [API 文档](docs/api.md) 说明参数、状态码和响应字段；在线路由与请求结构位于 `http://127.0.0.1:8080/docs`。
 
@@ -152,4 +154,15 @@ node tests/browser-regressions.mjs
 
 原有浏览器测试需要前端预览服务和本机 Chrome；`browser-regressions.mjs` 自行启动隔离的 Vite 服务，使用接口样例验证交互，不调用真实模型。`node tests/browser-live.mjs` 会调用当前真实模型，并清理自己命名的临时资料；这些测试问答仍按产品规则保存在历史中，可在历史列表删除。详见前端 README。
 
-离线评估入口：`python scripts/eval_retrieval.py --help`。黄金集和既有基线见 [评估基线](docs/eval/retrieval-baseline-v1.md)。本次架构迁移未改检索算法，未重新宣称新的检索指标。
+离线评估入口：`python scripts/eval_retrieval.py --help`。黄金集和既有基线见 [评估基线](docs/eval/retrieval-baseline-v1.md)。各报告保留当时的语料、策略和指标口径，不能把样本结果推广成所有问题的正确率。
+
+## 能力边界与文档
+
+问答使用本次检索到的局部正文证据。资料列表接口可以返回总数，但问答流程尚未把数据库统计或完整目录作为上下文提供给模型，因此不保证回答全库数量、完整清单或全库概览。引用有效只说明可定位来源，不能证明统计对象正确或检索覆盖了全库。
+
+- [产品范围与用户故事](docs/总功能文档-Issue.md)
+- [架构与模块数据流](docs/架构设计.md)
+- [API 文档](docs/api.md)
+- [检索质量评估](docs/评估检索质量.md)与 [评估报告](docs/eval/)
+
+当前没有查询改写重查、工具自主调用、分类树或网页评估看板。V2 将研究统计与目录如何作为上下文交给模型汇总；具体编排方式尚未实现。

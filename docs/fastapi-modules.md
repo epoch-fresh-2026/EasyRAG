@@ -16,7 +16,7 @@
 - HTTP `QuestionStreamResponse`：同步生产线程内登记 request_work，有界队列传送 SSE。断开先通知取消，再等待原线程关闭生成器；不跨线程强制 close，不通过后台未登记工作逃避停机等待。
 - E：临时纯文本与正式结果分开，只有 done 更新正式答案与历史列表；历史 selectionRevision 隔离迟到输出。
 
-原 POST /api/questions 保留。流式不引入会话记忆、检索改写、表迁移或模型热路径缓存。详见 [事件契约](api.md#流式问答)与[交付记录](m4-streaming-delivery-2026-09-20.md)。
+原 POST /api/questions 保留。流式不引入会话记忆、检索改写、表迁移或模型热路径缓存。详见 [事件契约](api.md#流式问答)与[交付记录](api.md#流式问答)。
 
 ```mermaid
 flowchart TD
@@ -115,7 +115,7 @@ ChatSession.complete(prompt) -> str
 
 模型失败不阻断资料浏览和配置。Chroma 失败时资料浏览/收录仍可用，新资料停在 PENDING。A 只处理自己的数据库异常；B 维护自身部分索引清理；G 根据公开结果决定跨模块恢复状态。
 
-M4 的 SDK 准备由 `Services.create()` 在移交资源前调用 F 的 `prepare()`，沿用上述进程锁和取消清理边界。SDK 导入失败只记录安全分类，不改变门禁状态；不缓存项目配置或客户端，`open_session()` 保留按 provider 懒加载。准备转移首次导入成本，具体约束与测量口径见 [M4 方案](m4-retrieval-and-history-plan-2026-09-15.md)。
+M4 的 SDK 准备由 `Services.create()` 在移交资源前调用 F 的 `prepare()`，沿用上述进程锁和取消清理边界。SDK 导入失败只记录安全分类，不改变门禁状态；不缓存项目配置或客户端，`open_session()` 保留按 provider 懒加载。准备转移首次导入成本，具体约束与测量口径见 [M4 方案](子Issue-C-问答Agent.md)。
 
 ## 兼容与恢复
 
@@ -158,4 +158,4 @@ M4 的 SDK 准备由 `Services.create()` 在移交资源前调用 F 的 `prepare
 | 真实索引恢复与维护全链路 | [#54](https://github.com/vansye/EasyRAG/pull/54)、[#55](https://github.com/vansye/EasyRAG/pull/55) |
 | 统一运行入口、CI、旧实现退出与本机切换 | [#56](https://github.com/vansye/EasyRAG/pull/56) |
 
-2026-09-15 已完成本机切换：新就绪审计拦截旧索引缺失，离线重建后 623 个切片 ID 全部保留，13 份原资料与真实浏览器流程验收通过。完整执行结果、配置归属和备份证据见 [切换与回退](fastapi-cutover.md)。所有 PR 保持待审查，未自动合并；URL 收录、检索改写和评估界面仍属后续规划。
+2026-09-15 已完成本机切换：新就绪审计拦截旧索引缺失，离线重建后 623 个切片 ID 全部保留，13 份原资料与真实浏览器流程验收通过。完整执行结果、配置归属和备份证据见 [切换与回退](../README.md)。所有 PR 保持待审查，未自动合并；URL 收录、检索改写和评估界面仍属后续规划。
