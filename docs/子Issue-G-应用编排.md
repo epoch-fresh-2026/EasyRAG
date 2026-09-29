@@ -53,4 +53,4 @@ GET /health -> {status, service, db, retrieval: {status, chroma, embedding, toke
 
 先在隔离 MySQL/Chroma/配置上验证，再停止原 Java 和 Python 进程及用户写入，成套备份资料库、索引和配置。A 校验旧 schema 并登记 Alembic 基线，新 FastAPI 占用 8080，验证原资料与问答后才开放写入。失败同步恢复旧版本与同一时间点的数据。#34 保持独立，不自动合并。
 
-2026-09-15 已执行：备份恢复核验通过，旧库接管未修改原行；首次 ready 发现 517 条缺失向量并阻止问答，停服重建后复用全部 623 个切片 ID，最终 READY。13 份原资料保留，真实网页完成配置、资料变更、引用和拒答验证，临时资料清理完成。过程与回退入口见 [切换记录](fastapi-cutover.md)，交付见 [PR #56](https://github.com/vansye/EasyRAG/pull/56)。
+2026-09-15 已执行：备份恢复核验通过，旧库接管未修改原行；首次 ready 发现 517 条缺失向量并阻止问答，停服重建后复用全部 623 个切片 ID，最终 READY。13 份原资料保留，真实网页完成配置、资料变更、引用和拒答验证，临时资料清理完成。过程与回退入口见 [切换记录](../README.md)，交付见 [PR #56](https://github.com/vansye/EasyRAG/pull/56)。
