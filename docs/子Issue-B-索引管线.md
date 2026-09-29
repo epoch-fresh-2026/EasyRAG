@@ -2,7 +2,7 @@
 
 ## FastAPI 迁移设计（2026-09-15，当前实施范围）
 
-Issue [#3](https://github.com/vansye/EasyRAG/issues/3)，父 Issue #1。位置：`app/modules/retrieval`，总体见 [模块设计](fastapi-modules.md)。旧内部 HTTP 章节作为历史契约和测试证据保留。
+Issue [#3](https://github.com/vansye/EasyRAG/issues/3)，父 Issue #1。位置：`app/modules/retrieval`，总体见 [模块设计](架构设计.md)。旧内部 HTTP 章节作为历史契约和测试证据保留。
 
 B 独占切片、tokenizer、embedding 和 Chroma。只接受数据快照，不读取 MySQL、不调用 A/C/F/G，不解释文档业务状态、不包含 FastAPI。所有公开能力由 public 入口提供。
 

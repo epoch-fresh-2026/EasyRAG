@@ -1,6 +1,6 @@
 # 子 Issue F：回答模型配置与会话模块
 
-Issue：[#35](https://github.com/vansye/EasyRAG/issues/35)，父 Issue：#1。当前设计：[FastAPI 模块迁移](fastapi-modules.md)。位置：`app/modules/answer_models`。
+Issue：[#35](https://github.com/vansye/EasyRAG/issues/35)，父 Issue：#1。当前设计：[FastAPI 模块迁移](架构设计.md)。位置：`app/modules/answer_models`。
 
 ## 功能与用户故事
 
