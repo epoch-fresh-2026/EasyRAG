@@ -1,216 +1,166 @@
 # 子 Issue C：问答 Agent 模块
 
-## M4 第三项：判定器标出相关片段，生成只看子集（2026-09-22，C-6）
+本文供维护知识库问答流程、模型提示词与引用契约的开发者使用。阅读后应能追踪一次回答为何直答、部分回答或拒答，并判断技术失败应在哪里暴露。总体边界见[架构设计](架构设计.md)，浏览器入口见[公共 API](api.md)。
 
-继续关联 #27 / #1。判定器的 JSON 由 `{"verdict"}` 扩为 `{"verdict", "relevant": [n, …]}`：`relevant` 是与问题主题直接相关、支撑该判定的片段编号；生成提示只列这些片段，**编号沿用检索 rank 不重编**，正文引用必须落在其中，`AnswerDraft.chunk_ids` 也只含这些片段。`QaTraceEntry` 新增 `relevant`（选中的 rank，按候选顺序去重）；`retrieved` 仍记录全部候选，G 与前端按 rank 解析出处的逻辑不变。
+## 一、职责
 
-契约细则：
+问答模块 `qa` 负责证据判定、生成与拒答、引用编号校验和 trace。它只依赖自己声明的 `SearchPort`、`ChatPort` / `StreamChatPort`，不直接导入 A/B/F/G、FastAPI、Chroma 或模型 SDK。
 
-- SUFFICIENT / PARTIAL 时 `relevant` 必须是非空整数数组、编号落在 `1..k`；空数组、越界、非整数、非数组都是 `QaError("judge", "INVALID_JUDGE_OUTPUT")`，不进入生成。
-- NONE 时忽略 `relevant`，trace 记为空。
-- **缺失 `relevant` 视为全部候选**（与 C-6 之前的行为一致）。没输出字段和输出了错误字段是两件事：前者退回旧契约、可被评估脚本按"送入生成的比例"度量；后者是模型给出了错误指令，必须响亮失败。这样既不把格式遗漏升级成用户可见的 502，也不让错误编号静默通过。
-- `citations_are_valid(markdown, allowed)` 接受允许的 rank 集合（旧的整数 k 仍表示 `1..k`），区间 `[a-b]` 展开后逐个检查。
+G 注入 B 的检索适配器和 F 打开的模型会话，获取 C 的结果后调用 A 补全出处、保存问答快照。问题向量化和混合检索属于 B；C 决定如何使用返回证据。模型配置与探测属于 F，HTTP、门禁、取消控制和历史提交属于 G。
 
-| # | 裁决 | 理由 |
-|---|---|---|
-| C-6 | 判定器在同一次调用里多输出"哪些片段支撑判断"，生成与引用只看这些片段 | 不违背 C-4——仍是两次独立的结构化调用，判定输出仍是结构化判断，只是从一个枚举值变成枚举值加编号列表；不把判定并入生成。收益来自两处：送入生成的证据 token 减少（"效率 = 端到端延迟"唯一有实质空间的杠杆，生成占八成以上），以及不相关片段不再进入生成上下文（跨文档串扰）。数字见子 Issue D 的 relevant 对照 |
-| C-2 复核（2026-09-22） | 有界改写重查继续不做 | 难例集 v3（错别字、缩写、中英混用、专篇压制短卡）在混合检索下离线 hit@1 15/15；v1/v2/v3 三集都没有漏召回的题，改写重查没有可救的对象。钩子保留，触发条件写明：某集出现 hybrid 仍未进 top-5 的 Q/R 题 |
+当前是固定的一轮检索流程，没有 `create_agent`、自主工具选择、查询改写或重查。多步骤来自“检索 → 判定 → 分流 → 生成或拒答”，不能把 trace 的结构扩展能力写成已经执行多轮。
 
-## M4 第一项：回答约束与计时（2026-09-16）
+## 二、当前行为
 
-继续关联 #27 / #1，按 [M4 方案](子Issue-C-问答Agent.md) 实施。检索为空时直接 REFUSED，不调用判定/生成；非空候选保持原有三态判断及一轮检索。
+### 单轮检索与三态判定
 
-生成结果返回前校验正文来源编号：必须有引用，且所有编号在本轮 `1..k` 内。未引用、全部越界或混合越界均为 `QaError("generate", "INVALID_CITATIONS")`，由 G 返回技术失败，不自动重试或保存历史。代码、链接、图片、HTML 与转义文本中的数字不是正文引用；前后端以 `tests/contracts/answer-citations.json` 的共享样例核对。该校验确认编号可映射到来源，不声称能自动证明每个事实都由来源支持。
-
-```python
-answer(question, search, chat, top_k=5, *, record_timing=None) -> AnswerDraft
-# record_timing("judge" | "generate", elapsed_ms)
-# 回调只承载本次模型调用耗时，不包含问题、提示词或模型凭据。
+```text
+问题
+  → B 的默认混合检索，top_k=5
+  → 无候选：直接 NONE，不调用判定或生成
+  → 有候选：同一回答模型会话完成结构化判定
+      ├─ SUFFICIENT → 按 relevant 筛选 → 生成 → 引用校验 → ANSWERED
+      ├─ PARTIAL    → 按 relevant 筛选 → 带覆盖边界生成 → 引用校验 → PARTIAL
+      └─ NONE       → 固定拒答，不生成 → REFUSED
 ```
 
-`chunk_ids` 保留所有交给生成器的证据，不缩为正文实际引用的子集。G 继续按最终 trace rank 补全出处与保存快照。未执行的模型阶段不产生计时；失败调用也报告耗时，之后仍抛出原有安全异常。SDK 准备、流式、有界重查按后续独立任务推进。
+问题必须非空白，最多 2,000 个 Unicode 码点，验证后保留原文本。`top_k` 在模块入口可配置且必须为正整数，当前应用调用使用默认 5。每次回答只调用一次 search，trace 中 `round_index=1`。
 
-## FastAPI 迁移设计（2026-09-15，当前实施范围）
+| 判定 | 含义 | 行为 |
+|---|---|---|
+| `SUFFICIENT` | 有与主题直接相关的片段，足以支撑完整回答 | 只依据选中片段作答 |
+| `PARTIAL` | 有直接相关内容，但缺失的是问题主体而非边角 | 基于已有内容作答，并声明库中覆盖范围和无法回答的部分 |
+| `NONE` | 没有与主题直接相关的片段，词面相似不算直接相关 | 返回“知识库中没有找到能回答这个问题的内容。” |
 
-Issue [#27](https://github.com/vansye/EasyRAG/issues/27)，父 Issue #1。位置：`app/modules/qa`，总体见 [模块设计](架构设计.md)。旧 Java 入口与具体 IndexStore 调用作为历史记录保留。
+这个判定不由相似度阈值决定。分数可以表达检索相似程度，却不能说明片段是否覆盖问题主体；相关专题也可能不足以回答具体问题。PARTIAL 必须同时满足“直接相关”“不足以完整回答”“缺失主体”，避免把任意边角缺失都判为部分覆盖。
 
-C 自己维护提示词、判断、生成、拒答、引用编号和 trace，只依赖自己声明的能力端口。检索适配器和模型会话由 G 注入；不得 import A/B/F/G、FastAPI、Chroma 或模型 SDK。无需数据库或模型服务即可单独测试。
+### relevant 与原始编号
+
+判定提示要求模型在同一次调用中给出状态和相关片段编号：
+
+```json
+{"verdict": "SUFFICIENT", "relevant": [1, 3]}
+```
+
+候选按检索顺序编号 `1..k`。`relevant` 表示支撑判定的候选 rank，不是 chunk ID。生成提示只包含被选中的证据，编号仍沿用原 rank，**不压缩为新的连续编号**；例如选中 `[1, 3]` 时，生成器只能引用 `[1]` 和 `[3]`。
+
+- `SUFFICIENT` / `PARTIAL` 的 relevant 若出现，必须是非空整数数组，编号处于 `1..k`；布尔值、越界值、非数组和空数组均是 `INVALID_JUDGE_OUTPUT`，不进入生成。
+- 重复编号去重，最终选择顺序按原候选顺序，而非模型列出的顺序。
+- 缺少 relevant 时保留全部候选；格式遗漏与模型明确输出错误指令采用不同处理。评估按实际送入生成的证据计算压缩比例。
+- `NONE` 忽略 relevant，trace 记空数组，不调用生成。
+
+`trace.retrieved` 保留全部候选及原排名，`trace.relevant` 保留被选中的 rank。`AnswerDraft.chunk_ids` 包含全部交给生成器的证据 ID，不缩为正文实际引用的子集。relevant 是已实现的后端契约；它本身不代表前端已经展示“采用”标签。
+
+### 生成与引用校验
+
+生成提示要求只使用片段中的信息，并在事实性结论后用 `[n]` 标注来源。PARTIAL 额外要求说明未覆盖的范围。判定和生成是两次独立调用，使用 G 为本次问题打开的同一个模型会话；运行中更改配置不会更换正在回答的模型。
+
+答案返回前，C 检查至少存在一个正文引用，且全部引用编号属于选中证据集合。支持单号、列表和范围；如只选中 `{1, 3}`，`[1,3]` 合法，`[1-3]` 因包含 2 而非法。代码、链接、图片、HTML 和转义文本中的数字不当作正文引用。前后端使用共享引用样例保持 Markdown 解析口径一致。
+
+无引用、全部越界或部分越界均抛出 `QaError("generate", "INVALID_CITATIONS")`，不自动重试，也不保存为成功历史。这个检查只证明引用编号能映射到允许的来源，不能证明每句话都受来源支持；语义忠实度需要独立在线评估。
+
+### 流式回答与失败
+
+流式入口复用同一套检索、判定和 relevant 筛选。可生成时依次产生 `sources`、零到多段 `delta`，累积答案通过引用校验后才产生 `done`。拒答直接产生完成结果，不调用生成。消费者取消后，在下一个阶段和读取模型分块前后检查取消状态，并关闭嵌套生成器；已开始的同步模型调用不因此保证被立即中断。
+
+部分文本到达不代表回答成功。最终引用校验失败时，流不会产生成功 `done`；G 负责把取消、模型故障和历史提交结果映射到 HTTP/SSE 行为。完整事件契约见[公共 API](api.md)，提交边界见[应用编排](子Issue-G-应用编排.md)。
+
+模型输出无法解析、非法判定、空模型内容、检索失败或生成失败都是技术错误。拒答是有依据的业务结果，不能拿技术错误代替拒答，否则拒答正确率会失去意义。C 只暴露 `QaError(stage, cause)` 的阶段与安全原因分类，原始上游响应体不越过模块边界。
+
+`record_timing(stage, elapsed_ms)` 分别记录 `judge`、`generate`，失败调用也记录耗时；未执行的阶段不生成计时。回调不包含问题、提示词和凭据。B 的 embedding/索引耗时以及 G 的模型会话、出处、历史与总耗时单独记录。
+
+## 三、数据与接口
+
+### 能力端口与结果（伪代码）
 
 ```python
 Evidence = {chunk_id, document_id, text, heading_path, score}
-SearchPort.search(query: str, top_k: int) -> tuple[Evidence]
-ChatPort.complete(prompt: str) -> str
-AnswerDraft = {answer, status, chunk_ids, trace}
-answer(question, search: SearchPort, chat: ChatPort, top_k=5) -> AnswerDraft
-```
 
-保留现有三态判断、提示词、轮次和 trace 字段；不启用此前尚未实现的改写或额外模型调用。NONE 不生成；模型输出无法解析是技术失败，不伪装成库外拒答。每次问答的临时 trace 独立。C 输出 chunk ID，最终业务出处由 G 调 A 补充。
+SearchPort.search(query, top_k=5) -> tuple[Evidence]
+ChatPort.complete(prompt) -> str
+StreamChatPort.stream(prompt) -> Generator[str]
 
-- [x] 能力端口与问答引擎，注入检索/模型替身完成三态、引用、解析失败及请求状态隔离回归（PR #46）。
-- [x] 集成验证判定与生成使用同一模型会话；模型更换不影响在途问答（PR #52、#55）。
-- [x] 模块 import 约束通过；G 的适配器变化不修改 C 的算法实现。
-
-实现见 [PR #46](https://github.com/vansye/EasyRAG/pull/46)，问答装配与最终 trace rank 对齐见 [PR #52](https://github.com/vansye/EasyRAG/pull/52)，真实 SQL/Chroma/HTTP 模型集成见 [PR #55](https://github.com/vansye/EasyRAG/pull/55)。改写重查保留原规划状态，本次不增加调用轮数。
-
-## 历史实现与契约：旧调用入口
-
-> 父 Issue：#1 总功能文档
-> 位置：Python（`rag-service/app/qa.py`）+ Java 入口（`server`）
-> 对应考察点：检索链路与不准的兜底（必答题 2）、agent 处理"一步答不好"（必答题 3）、拒答（追问 1）
-> 目标用户故事：**U4 答案 + 可点开的出处**、**U5 库外拒答**、U7 检索过程可见（trace 供给前端）
-
-## 一、为什么需要这个模块
-
-收录链路（A-1）已把资料变成可检索的向量索引，但没有任何入口能"问一句"。三条兜底功能中的第二条——基于知识库内容问答、答案能溯源——是本项目的核心，也是评审最想看的部分。
-
-## 二、功能描述
-
-```
-问题 → 检索 top-k 片段 → 三态判定 → 分流
-                                    ├─ SUFFICIENT → 生成带 [n] 引用的答案
-                                    ├─ PARTIAL    → 带边界声明生成（改写钩子位，M2 不启用）
-                                    └─ NONE       → 拒答，不进入生成
-```
-
-**三态判定标准**（判断力记录 #15，实测排除相似度阈值与子方面覆盖数后确定）：
-
-1. top-k 中至少一个片段与主题直接相关（非词面巧合）
-2. 该片段无法支撑完整回答（把片段单独交给 LLM 问"仅凭这段能否完整回答"）
-3. 缺失部分是问题主体而非边角
-
-第 2 条是核心，1、3 是护栏。判定输出结构化三值 `SUFFICIENT | PARTIAL | NONE`。
-
-**拒答是一等行为**（架构不变量 4）：判定为 NONE 不调用生成，返回固定的"库里没有相关内容"语义——不编造、不用低分片段凑数。
-
-**trace 结构**（供 U7 前端展示检索过程）：
-
-```
-trace = {
-  rounds: 1,                        # 检索轮数（改写启用后可为 2）
-  retrieved: [                      # 本轮检索的 top-k，含分数
-    {chunk_id, document_id, score, rank}
-  ],
-  decision: "SUFFICIENT",           # 三态判定结果
-  # 改写钩子：PARTIAL 时 rewrite → 重查 → 仍 PARTIAL 才带边界生成（M2 留位）
+TraceHit = {chunk_id, document_id, score, rank}
+QaTraceEntry = {
+    round_index: 1,
+    query: 原始问题,
+    retrieved: tuple[TraceHit],    # 全部候选，rank 从 1 起
+    decision: SUFFICIENT | PARTIAL | NONE,
+    relevant: tuple[int],         # 选中候选的原 rank
 }
+AnswerDraft = {
+    answer: str,
+    status: ANSWERED | PARTIAL | REFUSED,
+    chunk_ids: tuple[int],        # 所有选中证据；不表达排名
+    trace: tuple[QaTraceEntry],   # 当前只有一条
+}
+
+Qa.answer(question, search, chat, top_k=5, *, record_timing=None) -> AnswerDraft
+Qa.stream(question, search, chat, top_k=5, *, record_timing=None,
+          cancelled=lambda: False) -> Generator[QaStreamEvent]
+QaStreamEvent = sources(chunk_ids, trace) | delta(text) | done(AnswerDraft)
+validate_question(question) -> None
 ```
 
-## 三、内部逻辑拆分（用接口表示）
+C 无新增数据库表，也不读取 A 的文档标题或原文字节位置。B 返回纯正文及标题路径；G 依据 chunk ID 调 A 获取完整 `Source`，再按 trace rank 对齐。若来源缺失或无法匹配，G 将其视为索引一致性错误，需要恢复，不把缺少出处的答案当作成功结果。
 
-现有组件（复用，不改）：
+```text
+POST /api/questions  {question}
+  → {answer, status, sources, trace, history_id, created_at, model, elapsed_ms}
 
-```
-embed_texts(client, [question], settings) → [[float]]     # app/embedding.py，问题向量化
-create_chat_model(settings) → BaseChatModel               # app/llm.py，判定与生成共用
-IndexStore（新增 query，见子 Issue B 侧改动）
-```
-
-本模块新增：
-
-```
-app/retrieval.py
-  retrieve(question, settings, index) → RetrievedChunk[]
-    1. 问题 embedding（embed_texts，单条）
-    2. IndexStore.query(vector, top_k)
-  RetrievedChunk = {chunk_id, document_id, text, heading_path, score}
-
-app/qa.py
-  judge(question, chunks, model) → "SUFFICIENT"|"PARTIAL"|"NONE"
-    LLM 结构化输出：严格 JSON 解析，失败是错误不是静默拒答
-  generate(question, chunks, model) → answer
-    prompt 给片段编号 [1..k]，要求引用标记 [n]；拒绝编造未给出的内容
-  answer_question(question) → {answer, status, chunk_ids, trace}
-    单轮编排（rounds=1）；PARTIAL → 带边界声明生成（钩子注释位）
-    status: "ANSWERED"|"PARTIAL"|"REFUSED"
-
-app/main.py 新端点
-  POST /query {question: string}
-    → 200 {answer, status, chunk_ids[], trace}
-    → 422 空/超长问题
-    → 503 EMBEDDING_UNAVAILABLE / INDEX_UNAVAILABLE / LLM_UNAVAILABLE
+POST /api/questions/stream  {question}
+  → SSE：来源、文本增量、最终结果或错误
 ```
 
-Java 侧新增：
+普通问答的输入错误返回 400，业务门禁未就绪返回 503，判定/生成技术失败由 G 映射为 502。流式开始后的错误由 SSE 事件表达，不复用已经发出的 HTTP 状态。详细状态码、事件名和快照格式以[公共 API](api.md)为准。
 
-```
-QuestionController（POST /api/questions）
-  1. gate.tryAcquire(QUERY)——RECOVERY_REQUIRED/MUTATING 态 → 503 明确反馈，
-     不调 LLM，不伪装成"检索无结果"
-  2. RagQueryClient → Python POST /query
-  3. chunk_ids → MySQL 补出处（标题、byte_start/byte_end、heading_path）
-  4. 响应 {answer, status, sources[], trace}
-     sources = [{chunk_id, document_id, title, byte_start, byte_end,
-                 heading_path, text}]
-```
+### 一次编号对齐示例
 
-## 四、用示例把接口串起来
-
-**直答路径（Q1：什么是 ACID？）**
-
-```
-① POST /api/questions {question: "什么是 ACID？"}
-   Java: QUERY 租约（READY 态，与其他 QUERY 并发不互斥）
-② Python /query
-   embed_texts(["什么是 ACID？"]) → 1024 维向量
-   IndexStore.query(vec, k=5) → ACID.md 的 3 个片段 + Redis 事务 2 个
-   judge("什么是 ACID？", 5 片段) → SUFFICIENT
-     （第 1 片即"ACID 指原子性/一致性/隔离性/持久性"，可完整回答）
-   generate → "ACID 是……[1]。事务隔离级别……[3]"
-③ Java 用 chunk_ids 查 MySQL → sources 带 title="数据库事务 ACID 特性"、
-   byte 偏移、heading_path="详细 > 概念"
-④ 前端：答案 + 出处可点开（定位到文档与字节区间）+ trace（5 片段、判定结果）
+```text
+检索：rank 1 → chunk 101，rank 2 → chunk 205，rank 3 → chunk 309
+判定：{"verdict":"PARTIAL", "relevant":[3, 1, 3]}
+选中：rank 1 → chunk 101，rank 3 → chunk 309
+生成：只看 [1] 与 [3]，要求声明覆盖边界
+答案：正文含 [3]，状态 PARTIAL
+校验：允许集合 {1, 3}，通过
+输出：chunk_ids = [101, 309]；trace 仍含三个候选，relevant = [1, 3]
+G：补全两个 Source，按 rank 1、3 排序，保存完成快照
 ```
 
-**拒答路径（N1：Redis 的 GEO 命令怎么用？）**
+即使正文只引用 `[3]`，返回的 sources 仍包含全部交给生成器的两个片段。客户端必须按 trace 的原 rank 映射引用，不能用 sources 数组下标重新编号。
 
-```
-② IndexStore.query → Redis 事务/过期处理等片段（词面相似，主题不相关）
-   judge → NONE（判据 1 不满足：无片段与 GEO 直接相关）
-   不调 generate，直接返回
-③ {answer: "知识库中没有找到能回答这个问题的内容。", status: "REFUSED",
-    chunk_ids: [], trace: {rounds:1, retrieved:[...], decision:"NONE"}}
-```
+## 四、关键取舍与有效裁决
 
-**为什么出处由 Java 补而不是 Python 返回**：Python 只认识 chunk_id（派生索引里没有文档标题等业务数据）。标题、路径是 MySQL 的真相，去查就违反"B/C 不反向调用 A"。出处补全是"业务出口"的职责，归模块 A。
+| 编号 | 当前结论 | 依据与代价 |
+|---|---|---|
+| C-1 | 使用自有固定步骤流程，不使用 `create_agent` | 检索、三态判定、分流和 trace 都能独立验证；当前没有需要模型自主规划工具调用的证据。 |
+| C-2 | 不做查询改写重查 | 原问题在当前混合检索评估中已经召回目标文档，增加一轮没有已证实的可挽救样本；触发重新评估的条件是出现 hybrid top-5 仍遗漏标注来源的 Q/R 题。 |
+| C-3 | 当前只执行一轮；若后续验证重查，预算方向为总计最多两轮 | “初始检索 + 至多一次改写”是尚未启用的方向，不是现有 `max_rounds` 参数或第二轮实现。额外轮次同时增加模型和检索成本。 |
+| C-4 | 判定和生成共用同一模型会话，但保持两次独立调用 | 判定结果可单独测试和统计；省去第二套模型配置与探测，不把判断隐藏在最终答案里。 |
+| C-5 | 回答模型支持 API 为主、本地可切 | 由 F 管理 provider/model/base_url 与会话快照，C 不分 provider，也不把某次评估模型写成代码默认值。 |
+| C-6 | 判定同时选出 relevant，生成和引用只使用选中片段 | 减少无关上下文和生成提示长度，同时保留原编号；错误编号显式失败，字段缺失回退全部候选。 |
 
-**为什么判定失败是错误而不是拒答**：拒答是有依据的业务判断（"库里没有"），LLM 输出解析失败是技术故障（"没判出来"）。把后者伪装成前者，会让"拒答正确率"这个评估指标失去意义——错误和正确拒答混在一个分母里。
+### C-2：为什么暂不增加检索轮次
 
-## 五、数据原型
+v1 的 R 类六题虽然标为“需改写”，原问题已全部进入 top-5。补充 v2 后，dense 的 Q21 漏召回由 B-17 的混合检索解决；[v3 难例报告](eval/retrieval-v3-hybrid-2026-09-22.md)包含错别字、缩写、中英混用和专题压制短卡，hybrid 的 Q/R hit@1 为 15/15。当前 v1/v2/v3 中，没有 hybrid top-5 遗漏标注来源的 Q/R 题。
 
-无新表。检索读 Chroma（chunk_id 作 id、正文作 documents 载荷、metadata 含 document_id/seq/heading_path）；出处查 MySQL `chunk JOIN document`。
+这些样本支持暂不增加轮次，不代表重查永远无效，也不代表检索命中后一定答得完整。部分覆盖和引用不忠实可能发生在候选已正确召回之后，需要先区分检索与生成问题。V2 只保留有界重查方向；分类树、全库统计和资料目录/概览问答均未实现，此处不扩展新的工具设计。
 
-**模块 B 侧一处前置修正**：Chroma 的 documents 载荷现存的 `embedding_text`（正文+标题路径拼接串）改为存 `chunk.text`（纯正文）。向量是显式传入的，改载荷不影响向量；不改的话检索回来拿不到干净正文，而"为拿原文反向查 Java"违反边界。已有索引重灌即可（reset + 重新收录）。
+### C-6：证据筛选的收益与限制
 
-## 六、模块边界
+[relevant 在线报告](eval/answers-relevant-2026-09-22.md)中，32 道已作答问题的 160 个候选只将 76 个送入生成，比例 47.5%；没有出现标注出处进入候选却被判定器剔除的题。相对[全部候选对照](eval/answers-hybrid-2026-09-22.md)，生成提示字符数中位数从 1,881 降至 1,096，完整请求中位数从 8,927 ms 降至 6,116 ms。
 
-**C 负责**：问题向量化、检索编排、三态判定、生成与拒答、trace。
-**C 不负责**：怎么切片、索引维护（B）；对外 REST 与出处补全（A）；评估指标计算（D）。
-**依赖方向**：A → C（HTTP 调用），C → B（进程内函数调用，读本地派生索引）。C 无任何出站调用（除 LLM/embedding API）——**不存在依赖循环**。
+同一批报告的错源率均为 0/30，库外拒答正确率均为 10/10；引用支持率从 85.7% 到 87.3%，仍有不被来源支持的句子。模型输出、上游延迟和样本规模限制了这些数字的外推范围；它们是已有对照证据，不是稳定延迟承诺，也不能将编号合法当成答案忠实。
 
-## 七、验收
+## 五、验证依据
 
-- [ ] Q1 类问题（答案明确在库）→ 答案含 [n] 引用，sources 的 title/byte 偏移能定位到正确文档与区间
-- [ ] N1 类问题（主题不在库）→ REFUSED，明确说库里没有，不编造，不调用生成
-- [ ] 判定器返回非法输出（JSON 解析失败）→ 503 错误，不是 REFUSED
-- [ ] 闸门未就绪/索引变更中提问 → 503 明确反馈，不调 LLM，不伪装成无结果
-- [ ] trace 结构完整：rounds、retrieved（含分数与排名）、decision
-- [ ] PARTIAL 类问题（P1 多头注意力）→ 带边界声明的回答（"库中仅有……的简要提及"）
-- [ ] 检索 top-k 可配置（默认 5）
-- [ ] LLM/模型配置可切换（API 与本地），行为一致
+| 验收对象 | 应验证的行为 | 现有依据 |
+|---|---|---|
+| 三态流程 | 无候选不调用模型，NONE 不生成，PARTIAL 一轮并声明边界 | `test_qa_module`、`test_qa_answer_contract` |
+| relevant | 子集使用原 rank、缺失回退、错误字段失败、NONE 忽略、并发状态不串扰 | `test_qa_module` |
+| 引用 | 至少一个正文引用、允许集合校验、范围展开、Markdown 非正文排除 | `test_qa_answer_contract` 和共享 `answer-citations.json` 样例 |
+| 流式 | 来源先于增量，最终校验后才 done，取消阻止后续阶段，关闭模型流 | `test_qa_stream`、应用/HTTP 流式测试 |
+| 业务出口 | 同一模型会话、原 rank 对齐、来源完整、历史提交失败不报成功 | `test_application_questions`、`test_question_stream`、真实 MySQL HTTP 集成 |
+| 可替换性 | 使用端口替身即可测试；C 不导入其他业务模块或 SDK | `test_module_boundaries` |
 
-## 八、已裁决（2026-09-12，两圈讨论）
-
-| # | 问题 | 结论 | 理由 |
-|---|---|---|---|
-| C-1 | 循环形态 | **自研有界循环，不用 create_agent** | 评审标准"只看跑通了什么、想清楚了什么"；固定步骤可测、trace 结构完整（U7 需要）；基线数据（6 道需改写题原问题全部命中 top-5）是"多步无增益"的现成证据。多步≠必须 tools：三态判定+分流本身就是多步流程。后续可将检索注册为真 tool 做对照实验（自主检索词 vs 原问题的命中率）——若补难例后有增益，即带数字的创新点 |
-| C-2 | 改写重查 | **M2 不做，留钩子** | 同上数据依据；不为未被证明的收益加复杂度 |
-| C-3 | max_rounds | **2**（初始 + 至多 1 次改写） | 30 题规模无证据支持更多轮；每多一轮是 LLM+检索双重成本 |
-| C-4 | 判定器模型 | **与生成器同一个 LLM** | 判定与生成需要的语言能力相同；省一套配置与探测；API 模型结构化遵循度高 |
-| C-5 | LLM 默认 | **API 为主、本地可切** | 真实使用以 API（deepseek 等）为主，Ollama 作离线备选。provider/model/base_url 三元组配置即切，代码零改动 |
-
-## 九、与其他模块的接口边界
-
-- 对 A：`POST /query` 只被 Java 调用（内部端点，不暴露给前端）；错误码风格与 /chunk、/embed 一致（`detail.error` + cause）
-- 对 B：C 读 IndexStore 的 query 方法（进程内），不直接碰 Chroma 客户端
-- 对 D：trace 结构是评估的原始材料（改写轮数、判定分布、检索分数——评估平台可直接消费）
-- 对 E：`{answer, status, sources[], trace}` 即前端问答页的完整数据契约
+离线召回与在线问答验收必须分开。[评估模块](子Issue-D-离线评估.md)说明拒答、部分覆盖、错源和引用支持率的口径；既有报告保留模型、语料、计时和适用范围，不能用某次命中率替代端到端回答质量。
