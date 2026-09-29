@@ -1,6 +1,6 @@
 # 子 Issue D：离线评估入口适配与回归
 
-Issue：[#37](https://github.com/vansye/EasyRAG/issues/37)，父 Issue：#1。当前设计：[FastAPI 模块迁移](fastapi-modules.md)。本次只适配既有离线工具，不增加评估数据库或网页功能。
+Issue：[#37](https://github.com/vansye/EasyRAG/issues/37)，父 Issue：#1。当前设计：[FastAPI 模块迁移](架构设计.md)。本次只适配既有离线工具，不增加评估数据库或网页功能。
 
 ## 功能与数据原型
 

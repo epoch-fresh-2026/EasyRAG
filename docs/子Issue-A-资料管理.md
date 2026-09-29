@@ -2,7 +2,7 @@
 
 ## FastAPI 迁移设计（2026-09-15，当前实施范围）
 
-Issue [#2](https://github.com/vansye/EasyRAG/issues/2)，父 Issue #1。位置迁移至 `app/modules/knowledge`。总体边界见 [模块设计](fastapi-modules.md)。下面旧 Spring Boot 章节保留为历史契约和验证记录。
+Issue [#2](https://github.com/vansye/EasyRAG/issues/2)，父 Issue #1。位置迁移至 `app/modules/knowledge`。总体边界见 [模块设计](架构设计.md)。下面旧 Spring Boot 章节保留为历史契约和验证记录。
 
 A 独占 document/chunk、输入解析、哈希、数据库迁移和文档状态；不调用 B/C/F，不包含 HTTP 路由、后台调度或索引计算。G 通过公开入口调用 A，数据库连接和行对象不跨模块。
 

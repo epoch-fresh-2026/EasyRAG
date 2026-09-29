@@ -32,7 +32,7 @@ answer(question, search, chat, top_k=5, *, record_timing=None) -> AnswerDraft
 
 ## FastAPI 迁移设计（2026-09-15，当前实施范围）
 
-Issue [#27](https://github.com/vansye/EasyRAG/issues/27)，父 Issue #1。位置：`app/modules/qa`，总体见 [模块设计](fastapi-modules.md)。旧 Java 入口与具体 IndexStore 调用作为历史记录保留。
+Issue [#27](https://github.com/vansye/EasyRAG/issues/27)，父 Issue #1。位置：`app/modules/qa`，总体见 [模块设计](架构设计.md)。旧 Java 入口与具体 IndexStore 调用作为历史记录保留。
 
 C 自己维护提示词、判断、生成、拒答、引用编号和 trace，只依赖自己声明的能力端口。检索适配器和模型会话由 G 注入；不得 import A/B/F/G、FastAPI、Chroma 或模型 SDK。无需数据库或模型服务即可单独测试。
 
