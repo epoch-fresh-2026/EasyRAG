@@ -1,4 +1,4 @@
-import type { AnsweredQuestion, ChunkSource } from '@/shared/api/types'
+import type { AnsweredQuestion, ChunkSource, TraceEntry } from '@/shared/api/types'
 
 export interface Citation {
   number: number
@@ -12,6 +12,12 @@ export interface AnswerPresentation {
   tokens: Token[]
   citations: Citation[]
   retrievedCount: number
+}
+
+export function retrievalLabel(round: TraceEntry, rank: number, reference?: number): string {
+  if (round.relevant === undefined) return reference ? `正文引用 ${reference}` : '检索结果'
+  if (!round.relevant.includes(rank)) return '未进生成'
+  return reference ? `采用 · 正文引用 ${reference}` : '采用'
 }
 
 export function presentAnswer(result: AnsweredQuestion): AnswerPresentation {
