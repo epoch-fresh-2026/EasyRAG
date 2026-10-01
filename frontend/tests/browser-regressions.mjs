@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { mkdir } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright'
 import { createServer } from 'vite'
@@ -381,6 +382,83 @@ try {
     assert.equal(await page.locator('.app-notices .notice-warm').count(), 1)
   })
 
+
+  await run('retrieval adoption stays distinct from citations in current and saved answers', async ({ page, answer, docs }) => {
+    docs.push({ ...docs[0], id: 3, title: 'Adopted but not cited', content: '# Additional evidence' })
+    answer.answer = 'Supported answer [2]'
+    answer.sources.push({ ...answer.sources[0], chunk_id: 30, document_id: 3, title: docs[2].title, text: docs[2].content })
+    answer.trace[0].relevant = [2, 3]
+    answer.trace[0].retrieved = [
+      { chunk_id: 20, document_id: 2, rank: 1, score: 0.9 },
+      { chunk_id: 10, document_id: 1, rank: 2, score: 0.8 },
+      { chunk_id: 30, document_id: 3, rank: 3, score: 0.7 },
+    ]
+    const artifacts = new URL('../.verification/u7/', import.meta.url)
+    await mkdir(artifacts, { recursive: true })
+    await page.goto(base + '/ask')
+    await page.waitForLoadState('networkidle')
+    await page.locator('#knowledge-question').fill('Show the evidence selection')
+    await page.locator('.send-button').click()
+    await page.locator('[data-history-id="1"]').waitFor()
+    for (const mode of ['current', 'history']) {
+      if (mode === 'history') {
+        await page.reload()
+        await page.locator('[data-history-id="1"] .history-select').click()
+        await page.locator('.history-answer-context').waitFor()
+      }
+      await page.locator('.trace-details > summary').click()
+      assert.deepEqual(await page.locator('.retrieval-label').allTextContents(), ['未进生成', '采用 · 正文引用 2', '采用'])
+      assert.equal(await page.locator('.trace-adoption-unavailable').count(), 0)
+      assert.equal(await page.locator('.source-card').count(), 1, 'only actual citations have source cards')
+      await page.locator('.answer-body .inline-citation').click()
+      await page.waitForFunction(() => document.activeElement?.id === 'citation-2')
+      for (const width of [1440, 390]) {
+        await page.setViewportSize({ width, height: 1000 })
+        await page.locator('.trace-details').scrollIntoViewIfNeeded()
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true, `${mode}: no overflow at ${width}px`)
+        assert.equal(await page.locator('.retrieval-label').evaluateAll(labels => labels.every(label => {
+          const row = label.closest('li').getBoundingClientRect(), bounds = label.getBoundingClientRect()
+          return bounds.left >= row.left - 1 && bounds.right <= row.right + 1
+        })), true, `${mode}: labels fit at ${width}px`)
+        await page.screenshot({ path: fileURLToPath(new URL(`${mode}-${width}.png`, artifacts)), fullPage: true })
+      }
+    }
+    await page.locator('.retrieval-snapshot > summary').last().click()
+    assert.equal(await page.locator('.retrieval-snapshot .source-snapshot').last().textContent(), docs[2].content)
+  })
+
+  await run('legacy history explains missing adoption without inferring it from saved sources', async ({ page, answer, seedHistory }) => {
+    answer.trace[0].retrieved.push({ chunk_id: 20, document_id: 2, rank: 2, score: 0.7 })
+    seedHistory(1, 'Legacy answer')
+    await page.goto(base + '/ask')
+    await page.locator('[data-history-id="1"] .history-select').click()
+    await page.locator('.history-answer-context').waitFor()
+    await page.locator('.trace-details > summary').click()
+    assert.deepEqual(await page.locator('.retrieval-label').allTextContents(), ['正文引用 1', '检索结果'])
+    assert.equal(await page.locator('.trace-adoption-unavailable').innerText(), '此记录未保存片段采用情况。')
+  })
+
+  await run('refused answers show explicit exclusions and an empty retrieval stays readable', async ({ page, answer, seedHistory }) => {
+    answer.answer = 'No supporting evidence'
+    answer.status = 'REFUSED'
+    answer.sources = []
+    answer.trace[0].decision = 'NONE'
+    answer.trace[0].relevant = []
+    seedHistory(1, 'Rejected candidates')
+    answer.trace[0].retrieved = []
+    seedHistory(2, 'No candidates')
+    await page.goto(base + '/ask')
+    await page.locator('[data-history-id="1"] .history-select').click()
+    await page.locator('.history-answer-context').waitFor()
+    await page.locator('.trace-details > summary').click()
+    assert.deepEqual(await page.locator('.retrieval-label').allTextContents(), ['未进生成'])
+    assert.equal(await page.locator('.trace-adoption-unavailable').count(), 0)
+    await page.locator('[data-history-id="2"] .history-select').click()
+    await page.locator('.answer-question h2').filter({ hasText: 'No candidates' }).waitFor()
+    await page.locator('.trace-details > summary').evaluate(element => { element.parentElement.open = true })
+    assert.equal(await page.locator('.retrieval-label').count(), 0)
+    assert.equal(await page.locator('.trace-no-results').innerText(), '本轮没有检索到相关片段。')
+  })
 
   await run('saved history survives reload and shows the full deleted-source snapshot', async ({ page, answer, docs, runtime, logs }) => {
     const snapshot = Array.from({ length: 14 }, (_, index) => 'Saved source line ' + (index + 1)).join('\n')

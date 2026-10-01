@@ -6,7 +6,7 @@ import { useDocumentStore } from '@/features/documents/store'
 import type { AnsweredQuestion } from '@/shared/api/types'
 import AppIcon from '@/shared/components/AppIcon.vue'
 import { useGateStore } from '@/shared/gate'
-import { presentAnswer } from '../model'
+import { presentAnswer, retrievalLabel } from '../model'
 import AnswerBody from './AnswerBody'
 
 const props = defineProps<{ result: AnsweredQuestion; question: string; elapsedMs: number; model: string; createdAt: string; stale: boolean; history: boolean; retryDisabled: boolean }>()
@@ -90,10 +90,11 @@ async function copyAnswer() {
     <details class="trace-details">
       <summary><span class="trace-summary-title"><AppIcon name="search" :size="16" />查看检索过程</span><span class="trace-summary-meta">{{ result.trace.length }} 轮检索<span>·</span>{{ presentation.retrievedCount }} 个片段<AppIcon name="down" :size="15" /></span></summary>
       <div class="trace-content">
-        <div class="trace-explanation"><AppIcon name="info" :size="15" />{{ history ? '这里展示当时的检索记录；已保存正文的片段可以展开阅读。' : '检索结果是模型参考的资料；正文引用标记指向答案实际标注的出处。' }}</div>
+        <div class="trace-explanation"><AppIcon name="info" :size="15" /><span>标为“采用”的片段已提供给回答模型；“正文引用”表示答案实际标注的出处。<template v-if="history">这里展示当时的记录；已保存正文的片段可以展开阅读。</template></span></div>
         <section v-for="round in result.trace" :key="round.round_index" class="trace-round">
           <div class="trace-round-heading"><span class="round-number">{{ String(round.round_index).padStart(2, '0') }}</span><strong>{{ decisionLabels[round.decision] }}</strong><span>{{ round.retrieved.length }} 个片段</span></div>
           <p class="trace-query"><span>检索问题</span>{{ round.query }}</p>
+          <p v-if="round.relevant === undefined" class="trace-no-results trace-adoption-unavailable">此记录未保存片段采用情况。</p>
           <ul class="retrieval-list">
             <li v-for="entry in round.retrieved" :key="entry.chunk_id" :class="{ 'is-historical': history }">
               <span class="retrieval-rank">{{ entry.rank }}</span>
@@ -102,7 +103,7 @@ async function copyAnswer() {
                 <span v-else class="retrieval-unavailable">资料 #{{ entry.document_id }} · 片段 #{{ entry.chunk_id }}<small>未保存该片段正文</small></span>
               </template>
               <button v-else @click="openDocument(entry.document_id, entry.chunk_id)">{{ sourceTitle(entry.document_id) }}</button>
-              <span class="retrieval-label" :class="{ cited: referenceNumber(entry.chunk_id) }">{{ referenceNumber(entry.chunk_id) ? `正文引用 ${referenceNumber(entry.chunk_id)}` : '检索结果' }}</span>
+              <span class="retrieval-label" :class="{ cited: referenceNumber(entry.chunk_id) }">{{ retrievalLabel(round, entry.rank, referenceNumber(entry.chunk_id)) }}</span>
             </li>
           </ul>
           <p v-if="!round.retrieved.length" class="trace-no-results">本轮没有检索到相关片段。</p>
