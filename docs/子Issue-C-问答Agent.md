@@ -49,7 +49,7 @@ G 注入 B 的检索适配器和 F 打开的模型会话，获取 C 的结果后
 - 缺少 relevant 时保留全部候选；格式遗漏与模型明确输出错误指令采用不同处理。评估按实际送入生成的证据计算压缩比例。
 - `NONE` 忽略 relevant，trace 记空数组，不调用生成。
 
-`trace.retrieved` 保留全部候选及原排名，`trace.relevant` 保留被选中的 rank。`AnswerDraft.chunk_ids` 包含全部交给生成器的证据 ID，不缩为正文实际引用的子集。relevant 是已实现的后端契约；它本身不代表前端已经展示“采用”标签。
+`trace.retrieved` 保留全部候选及原排名，`trace.relevant` 保留被选中的 rank。`AnswerDraft.chunk_ids` 包含全部交给生成器的证据 ID，不缩为正文实际引用的子集。前端按 relevant 展示“采用 / 未进生成”，并单独标注正文引用；旧记录缺少该字段时明确提示未保存采用情况。
 
 ### 生成与引用校验
 
