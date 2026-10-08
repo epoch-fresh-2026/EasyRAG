@@ -27,9 +27,10 @@ def verify_consistency(snapshots, entries):
         indexed = index_representatives(
             IndexChunk(chunk.id, chunk.text, chunk.heading_path, document.tags) for chunk in snapshot.chunks)
         by_id = {chunk.id: chunk for chunk in snapshot.chunks}
-        for representative in indexed:
+        # Index sequences are dense after deduplication; SQL keeps the original order.
+        for sequence, representative in enumerate(indexed):
             chunk = by_id[representative.chunk_id]
-            expected[chunk.id] = (document.id, chunk.seq, chunk.text, chunk.heading_path, document.tags)
+            expected[chunk.id] = (document.id, sequence, chunk.text, chunk.heading_path, document.tags)
     actual = {entry.chunk_id: (entry.document_id, entry.seq, entry.text, entry.heading_path, entry.tags)
               for entry in entries}
     if len(actual) != len(entries) or actual != expected:
