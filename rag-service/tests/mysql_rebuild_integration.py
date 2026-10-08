@@ -357,6 +357,38 @@ def test_adversarial_chunk_drafts_persist_and_rebuild_without_losing_source(serv
         assert readiness.ready().state == State.READY
 
 
+@pytest.mark.parametrize('paragraphs', [('dup', 'dup', 'one'), ('dup', 'one', 'dup', 'two')])
+def test_middle_duplicates_survive_reopen_and_rebuild_with_compact_index_order(services, paragraphs):
+    a, b = services.a, services.b
+    body = ''.join((text + ' ') * 40 + '\n\n' for text in paragraphs)
+    with readiness_for(a, b) as (readiness, gate):
+        assert readiness.ready().state == State.READY
+        document = a.create('middle-duplicates.md', body.encode('utf-8'))
+        assert Indexer(a, b, gate).run(document.id).outcome == 'INDEXED'
+        rows = a.snapshots()[0].chunks
+        assert len(rows) == len(paragraphs)
+        assert [row.seq for row in rows] == list(range(len(paragraphs)))
+        kept = [row for index, row in enumerate(rows) if paragraphs[index] not in paragraphs[:index]]
+        expected = {row.id: sequence for sequence, row in enumerate(kept)}
+        assert {entry.chunk_id: entry.seq for entry in b.inspect()} == expected
+        original_ids, original_source = chunk_ids(a), source_truth(a)
+        assert readiness.ready().state == State.READY
+
+    a.close()
+    b.close()
+    a = knowledge.Knowledge(services.sandbox.settings())
+    b = retrieval.Retrieval(services.settings)
+    services.cleanup.callback(a.close)
+    services.cleanup.callback(b.close)
+    with readiness_for(a, b) as (readiness, _):
+        assert readiness.ready().state == State.READY
+        rebuilt = rebuild_index(a, b)
+        assert rebuilt.chunks == rebuilt.reused_chunks == len(rows)
+        assert chunk_ids(a) == original_ids and source_truth(a) == original_source
+        assert {entry.chunk_id: entry.seq for entry in b.inspect()} == expected
+        assert readiness.ready().state == State.READY
+
+
 def test_repeated_paragraphs_keep_every_row_but_one_vector_and_stale_full_index_is_repaired(services):
     a, b = services.a, services.b
     body = ('dup ' * 40 + '\n\n') * 64

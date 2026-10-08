@@ -90,22 +90,33 @@ def test_failed_documents_may_keep_sql_chunks_but_have_no_queryable_vectors(work
     assert w.readiness.ready().state == State.READY
 
 
-@pytest.fixture
-def repeated(workflow):
+@pytest.fixture(params=[('dup','one','dup'), ('dup','dup','one')], ids=['trailing-duplicate', 'middle-duplicate'])
+def repeated(workflow, request):
     w=workflow
-    texts=('dup','one','dup')
+    texts=request.param
     chunks=tuple(knowledge.StoredChunk(101+seq,1,seq,text,seq*3,seq*3+3,'',1) for seq,text in enumerate(texts))
     w.a.snapshots.return_value=(knowledge.DocumentSnapshot(w.doc,chunks,True),)
     w.b.split.return_value=tuple(retrieval.ChunkDraft(text,'',seq*3,seq*3+3,1) for seq,text in enumerate(texts))
     w.a.begin_rebuild.return_value=chunks
     w.entries=tuple(retrieval.IndexEntry(c.id,1,c.seq,c.text,'',('tag',)) for c in chunks)
+    w.inputs=tuple(retrieval.IndexChunk(c.id,c.text,'',('tag',)) for i,c in enumerate(chunks) if c.text not in texts[:i])
+    w.expected=tuple(retrieval.IndexEntry(c.chunk_id,1,seq,c.text,'',('tag',)) for seq,c in enumerate(w.inputs))
     return w
 
 
 def test_ready_expects_only_the_first_of_identical_chunks_in_the_index(repeated):
     w=repeated
-    w.b.inspect.return_value=w.entries[:2]
+    w.b.inspect.return_value=w.expected
     assert w.readiness.ready().state == State.READY
+
+
+def test_representative_sequence_must_be_compact_even_when_sql_has_gaps(repeated):
+    w=repeated
+    w.b.inspect.return_value=(w.expected[0],replace(w.expected[1],seq=2))
+    with pytest.raises(RecoveryFailed):
+        w.readiness.ready()
+    assert w.gate.state == State.RECOVERY_REQUIRED
+    w.queue.submit.assert_not_called()
 
 
 @pytest.mark.parametrize('kept', [(0,1,2),(1,2),(0,)])
@@ -120,11 +131,11 @@ def test_stale_full_index_or_wrong_representative_requires_offline_recovery(repe
 def test_offline_rebuild_stores_every_chunk_but_embeds_identical_inputs_once(repeated):
     w=repeated
     w.b.replace.return_value=2
-    w.b.inspect.return_value=w.entries[:2]
+    w.b.inspect.return_value=w.expected
     result=rebuild_index(w.a,w.b)
     assert result.documents == 1 and result.chunks == 3
     assert len(w.a.begin_rebuild.call_args.args[1]) == 3
-    w.b.replace.assert_called_once_with(1,(retrieval.IndexChunk(101,'dup','',('tag',)),retrieval.IndexChunk(102,'one','',('tag',))))
+    w.b.replace.assert_called_once_with(1,w.inputs)
     w.b.replace.return_value=3
     with pytest.raises(RecoveryFailed):
         rebuild_index(w.a,w.b)
