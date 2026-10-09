@@ -37,14 +37,20 @@ DEFAULT_GOLDEN_SETS = (PROJECT_ROOT / "docs/eval/golden-set-v1.md", PROJECT_ROOT
 EXPECTED_DECISIONS = {"Q": ("SUFFICIENT", "PARTIAL"), "R": ("SUFFICIENT", "PARTIAL"), "N": ("NONE",), "P": ("PARTIAL",)}
 CATEGORY_LABELS = {"Q": "直答", "R": "需改写", "N": "库外", "P": "部分覆盖"}
 MIN_SENTENCE_CHARS = 4
+FAITHFULNESS_METRIC_VERSION = "cited_sentence_support_v2"
 _CITATION = re.compile(r"\[(\d+(?:\s*[,，\-–]\s*\d+)*)\]")
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
-# Sentences about the answer itself (boundary declarations, "based on the fragments above") make no factual claim.
-_META_SENTENCE = re.compile(r"覆盖边界|以上回答|仅基于|严格基于|基于提供的|基于已有|无法回答|无法确定|未提及|未包含|未涉及|不足以回答")
+# Only complete, narrow templates are exempt; unfamiliar or mixed wording must be checked.
+_META_SENTENCE = re.compile(
+    r"(?:覆盖边界(?:说明)?[：:]\s*)?"
+    r"(?:(?:以上|上述|本次)回答(?:仅|严格)?基于(?:提供的|已有的?|上述|以上)?(?:知识库)?(?:资料|片段)"
+    r"|无法回答(?:该问题|这个问题|此问题)?|无法确定)"
+)
 
 
 def is_meta_sentence(sentence: str) -> bool:
-    return _META_SENTENCE.search(sentence) is not None
+    text = _CITATION.sub("", sentence).strip().rstrip("。！？!?.").strip()
+    return _META_SENTENCE.fullmatch(text) is not None
 
 
 @dataclass(frozen=True)
@@ -305,7 +311,9 @@ def summarize(results: list[QuestionResult]) -> dict:
     supported = sum(result.supported for result in checked)
     unsupported = sum(result.unsupported for result in checked)
     summary["faithfulness"] = {
+        "metric_version": FAITHFULNESS_METRIC_VERSION,
         "checked_answers": len(checked),
+        "checked_sentences": supported + unsupported,
         "supported": supported, "unsupported": unsupported,
         "invalid": sum(result.support_invalid for result in checked),
         "support_rate": supported / (supported + unsupported) if supported + unsupported else None,
@@ -403,13 +411,16 @@ def render_report(report: dict) -> str:
     if parameters["faithfulness"]:
         rate = faith["support_rate"]
         lines += [
-            f"- 核对答案数：{faith['checked_answers']}；带引用的句子：支持 {faith['supported']}、不支持 {faith['unsupported']}、核对输出无效 {faith['invalid']}。",
+            f"- 指标口径：`{faith['metric_version']}`；仅整句匹配纯说明模板时跳过，混合事实或不确定句仍核对。",
+            f"- 核对答案数：{faith['checked_answers']}；带引用的句子：支持 {faith['supported']}、不支持 {faith['unsupported']}、核对失败或输出无效 {faith['invalid']}。",
             f"- 引用支持率：{'—' if rate is None else f'{rate:.1%}'}；存在不支持句子的题：{', '.join(faith['unsupported_ids']) or '无'}。",
+            f"- 分母为取得有效判官结果的带引用句：{faith['checked_sentences']}（支持 + 不支持）；核对失败或输出无效不进分母。",
             f"- 句子总数 {faith['sentences']}，其中无引用句 {faith['uncited_sentences']}（不核对，只计数），"
-            f"带引用的元话语句 {faith['meta_sentences']}（“以上回答基于片段”“覆盖边界说明”之类，不含事实断言，不核对）。",
+            f"带引用且整句匹配的纯元话语句 {faith['meta_sentences']}（如“以上回答严格基于片段”，不核对）。",
             "", "核对方式：答案去掉围栏代码与列表/标题标记后按句号/问号/感叹号/换行切句，以冒号结尾的引导句和纯加粗标题不算句子；"
             "每个带 [n] 的非元话语句连同所引片段交给同一模型判断“是否完全由片段支持”。它衡量的是生成是否越出片段，不衡量答案是否正确；"
-            "判官对改写与推理性补充偏严，支持率应读作下界。",
+            "引用编号合法不等于语义支持；判官可能双向误判，未经人工校准不能作为严格下界。"
+            "本口径不覆盖或重算旧报告，不能与旧关键词过滤口径直接比较。",
         ]
     else:
         lines.append("本次未开启 `--faithfulness`，未核对句子是否被片段支持。")
