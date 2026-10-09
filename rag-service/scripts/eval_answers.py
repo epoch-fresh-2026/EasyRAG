@@ -38,6 +38,7 @@ EXPECTED_DECISIONS = {"Q": ("SUFFICIENT", "PARTIAL"), "R": ("SUFFICIENT", "PARTI
 CATEGORY_LABELS = {"Q": "直答", "R": "需改写", "N": "库外", "P": "部分覆盖"}
 MIN_SENTENCE_CHARS = 4
 FAITHFULNESS_METRIC_VERSION = "cited_sentence_support_v2"
+RETRY_ACCOUNTING_VERSION = "retry_accounting_v2"
 _CITATION = re.compile(r"\[(\d+(?:\s*[,，\-–]\s*\d+)*)\]")
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 # Only complete, narrow templates are exempt; unfamiliar or mixed wording must be checked.
@@ -78,6 +79,10 @@ class QuestionResult:
     wrong_source: bool | None = None
     first_text_ms: float | None = None
     total_ms: float = 0.0
+    last_attempt_ms: float = 0.0
+    execution_ms: float = 0.0
+    backoff_ms: float = 0.0
+    attempt_history: list[dict] = field(default_factory=list)
     stage_ms: dict[str, float] = field(default_factory=dict)
     model_calls: int = 0
     attempts: int = 1
@@ -88,6 +93,7 @@ class QuestionResult:
     unsupported: int | None = None
     support_invalid: int | None = None
     support_calls: int = 0
+    support_sentences: int = 0
     meta_sentences: int = 0
     unsupported_sentences: list[dict] = field(default_factory=list)
 
@@ -188,6 +194,7 @@ def _complete_with_retries(session, prompt: str, cooldown: float, max_attempts: 
 def check_faithfulness(result: QuestionResult, session, rank_texts: dict[int, str], *,
                        pause: float = 0.0, cooldown: float = 0.0, max_attempts: int = 1) -> None:
     result.supported = result.unsupported = result.support_invalid = 0
+    recording = _RecordingSession(session)
     for sentence in split_sentences(result.answer):
         ranks = [rank for rank in cited_ranks(sentence) if rank in rank_texts]
         if not ranks:
@@ -197,9 +204,11 @@ def check_faithfulness(result: QuestionResult, session, rank_texts: dict[int, st
             continue
         if result.support_calls and pause:
             time.sleep(pause)
-        result.support_calls += 1
-        reply = _complete_with_retries(session, support_prompt(sentence, [(rank, rank_texts[rank]) for rank in ranks]),
+        result.support_sentences += 1
+        calls_before = len(recording.calls)
+        reply = _complete_with_retries(recording, support_prompt(sentence, [(rank, rank_texts[rank]) for rank in ranks]),
                                        cooldown, max_attempts)
+        result.support_calls += len(recording.calls) - calls_before
         verdict = None if reply is None else parse_support(reply)
         if verdict is None:
             result.support_invalid += 1
@@ -225,6 +234,7 @@ def evaluate_question(
     parts: list[str] = []
     trace = ()
     draft = None
+    question_started = perf_counter()
     for attempt in range(1, max_attempts + 1):
         result.attempts = attempt
         result.stage_ms.clear()
@@ -232,6 +242,7 @@ def evaluate_question(
         result.failure = None
         parts.clear()
         trace, draft = (), None
+        calls_before = len(recording.calls)
         started = perf_counter()
         try:
             for event in qa.stream(question.text, search, recording, top_k, record_timing=record_timing):
@@ -246,11 +257,28 @@ def evaluate_question(
                     trace = draft.trace
         except QaError as error:
             result.failure = f"{error.stage}:{error.cause}"
-        result.total_ms = (perf_counter() - started) * 1000
+        finished = perf_counter()
+        result.last_attempt_ms = (finished - started) * 1000
+        result.execution_ms += result.last_attempt_ms
+        result.attempt_history.append({
+            "attempt": attempt, "status": draft.status if draft is not None else None,
+            "failure": result.failure, "decision": trace[-1].decision if trace else None,
+            "elapsed_ms": result.last_attempt_ms, "first_text_ms": result.first_text_ms,
+            "stage_ms": dict(result.stage_ms), "model_calls": len(recording.calls) - calls_before,
+            "backoff_ms": 0.0,
+        })
         # Only upstream unavailability is retried; contract failures such as INVALID_CITATIONS are findings.
         if result.failure is None or not result.failure.endswith(":ModelUnavailable") or attempt == max_attempts:
             break
+        backoff_started = perf_counter()
         time.sleep(cooldown * attempt)
+        backoff_ms = (perf_counter() - backoff_started) * 1000
+        result.backoff_ms += backoff_ms
+        result.attempt_history[-1]["backoff_ms"] = backoff_ms
+    # Stop at the final Qa attempt, before result processing and support checks.
+    result.total_ms = (finished - question_started) * 1000
+    if result.first_text_ms is not None:
+        result.first_text_ms += (started - question_started) * 1000
     result.model_calls = len(recording.calls)
     result.generate_prompt_chars = next((chars for kind, chars in reversed(recording.calls) if kind == "stream"), None)
     result.answer = draft.answer if draft is not None else "".join(parts)
@@ -287,7 +315,17 @@ def _median(values: list[float]) -> float | None:
 
 
 def summarize(results: list[QuestionResult]) -> dict:
-    summary: dict = {"categories": {}}
+    summary: dict = {"categories": {}, "retry_accounting_version": RETRY_ACCOUNTING_VERSION}
+    attempted = [result for result in results if result.attempt_history]
+    first_successes = sum(result.attempt_history[0]["status"] is not None
+                          and result.attempt_history[0]["failure"] is None for result in attempted)
+    eventual_successes = sum(result.status is not None and result.failure is None for result in attempted)
+    summary["completion"] = {
+        "attempted_questions": len(attempted), "first_attempt_successes": first_successes,
+        "eventual_successes": eventual_successes,
+        "first_attempt_success_rate": first_successes / len(attempted) if attempted else None,
+        "eventual_success_rate": eventual_successes / len(attempted) if attempted else None,
+    }
     for category in "QRNP":
         selected = [result for result in results if result.category == category]
         summary["categories"][category] = {
@@ -341,6 +379,12 @@ def summarize(results: list[QuestionResult]) -> dict:
         "first_text_max": max((result.first_text_ms for result in generated), default=None),
         "total_median": _median([result.total_ms for result in results]),
         "total_max": max((result.total_ms for result in results), default=None),
+        "last_attempt_median": _median([result.last_attempt_ms for result in results]),
+        "last_attempt_max": max((result.last_attempt_ms for result in results), default=None),
+        "execution_median": _median([result.execution_ms for result in results]),
+        "execution_max": max((result.execution_ms for result in results), default=None),
+        "backoff_median": _median([result.backoff_ms for result in results]),
+        "backoff_max": max((result.backoff_ms for result in results), default=None),
         "refusal_total_median": _median([result.total_ms for result in results if result.status == "REFUSED"]),
         "stages_median": {stage: _median([result.stage_ms[stage] for result in results if stage in result.stage_ms])
                           for stage in ("embedding", "vector", "judge", "generate")},
@@ -351,6 +395,7 @@ def summarize(results: list[QuestionResult]) -> dict:
     summary["calls"] = {
         "question_calls": sum(result.model_calls for result in results),
         "support_calls": sum(result.support_calls for result in results),
+        "support_sentences": sum(result.support_sentences for result in results),
         "retried_questions": sum(result.attempts > 1 for result in results),
         "unavailable_after_retries": sum(bool(result.failure and result.failure.endswith(":ModelUnavailable"))
                                          for result in results),
@@ -374,6 +419,7 @@ def render_report(report: dict) -> str:
     evidence = summary["evidence"]
     faith = summary["faithfulness"]
     latency = summary["latency_ms"]
+    completion = summary["completion"]
     lines = [
         "# 在线问答验收报告（子 Issue D）", "",
         f"> 运行时间：{report['generated_at']}。真实判定/生成模型：{parameters['llm_provider']} / `{parameters['llm_model']}`；"
@@ -395,6 +441,9 @@ def render_report(report: dict) -> str:
         )
     lines += [
         "", "N 类“判定符合”即拒答正确率；Q/R 类不符合即误拒；P 类判 SUFFICIENT 记为冒充完整、判 NONE 记为误拒。技术失败（如 INVALID_CITATIONS）不计入拒答。", "",
+        f"首次技术成功：{_format_rate(completion['first_attempt_successes'], completion['attempted_questions'])}；"
+        f"最终技术成功：{_format_rate(completion['eventual_successes'], completion['attempted_questions'])}。"
+        "分母为有尝试记录的题数；正常作答、部分作答和拒答均算技术成功，不表示回答正确。", "",
         "## 出处", "",
         f"- 标注出处进入候选（Q+R）：{_format_rate(sources['expected_in_candidates'], sources['scored'])}；未进入：{', '.join(sources['missing_expected_ids']) or '无'}。",
         f"- 错源率（已作答且有引用的 Q/R 中，引用片段全部不属于标注出处）：{_format_rate(sources['wrong_source'], sources['answered_with_citations'])}；"
@@ -426,18 +475,25 @@ def render_report(report: dict) -> str:
         lines.append("本次未开启 `--faithfulness`，未核对句子是否被片段支持。")
     lines += [
         "", "## 耗时（毫秒）", "",
+        f"计时与调用口径：`{summary['retry_accounting_version']}`。", "",
         "| 指标 | 中位数 | 最大值 |", "|---|---:|---:|",
-        f"| 首段非空文本（含检索与判定，生成型问题） | {_format_ms(latency['first_text_median'])} | {_format_ms(latency['first_text_max'])} |",
-        f"| 完整请求（全部问题） | {_format_ms(latency['total_median'])} | {_format_ms(latency['total_max'])} |",
-        f"| 拒答完整请求 | {_format_ms(latency['refusal_total_median'])} | — |",
+        f"| 最终尝试首段非空文本（含此前尝试与退避） | {_format_ms(latency['first_text_median'])} | {_format_ms(latency['first_text_max'])} |",
+        f"| 整题总等待（问答流程） | {_format_ms(latency['total_median'])} | {_format_ms(latency['total_max'])} |",
+        f"| 最后一次尝试 | {_format_ms(latency['last_attempt_median'])} | {_format_ms(latency['last_attempt_max'])} |",
+        f"| 累计执行（全部尝试） | {_format_ms(latency['execution_median'])} | {_format_ms(latency['execution_max'])} |",
+        f"| 实际退避 | {_format_ms(latency['backoff_median'])} | {_format_ms(latency['backoff_max'])} |",
+        f"| 拒答整题总等待 | {_format_ms(latency['refusal_total_median'])} | — |",
     ]
     for stage, label in (("embedding", "问题 embedding"), ("vector", "向量检索"), ("judge", "判定调用"), ("generate", "生成调用")):
-        lines.append(f"| {label} | {_format_ms(latency['stages_median'][stage])} | — |")
+        lines.append(f"| {label}（最后一次尝试） | {_format_ms(latency['stages_median'][stage])} | — |")
     lines += [
         "", f"- 生成提示字符数中位数：{_format_ms(latency['generate_prompt_chars_median'])}；答案字符数中位数：{_format_ms(latency['answer_chars_median'])}。",
-        f"- 模型调用：问答 {summary['calls']['question_calls']} 次（判定 + 生成，含重试），引用核对 {summary['calls']['support_calls']} 次；"
+        f"- 模型调用：问答 {summary['calls']['question_calls']} 次（判定 + 生成），引用核对 {summary['calls']['support_sentences']} 句、"
+        f"实际调用 {summary['calls']['support_calls']} 次（调用次数均含失败和重试）；"
         f"因上游不可用重试过的题 {summary['calls']['retried_questions']}，重试后仍不可用 {summary['calls']['unavailable_after_retries']}。",
-        "- 耗时为本机脚本内测量，不含浏览器网络与渲染；首段文本时间是用户能看到首字的下界；重试过的题只保留最后一次尝试的耗时。", "",
+        "- 计时从进入问答重试循环至最后一次 Qa 尝试结束，包含检索、模型调用、实际退避及循环编排；"
+        "不含会话创建、逐句支持核对、题间停顿、产品 HTTP 入口、历史写库与浏览器渲染。不是浏览器端到端延迟。"
+        "首字取最终尝试出现文本的时刻；失败尝试已丢弃的文本时刻保留在逐次记录中。", "",
         "## 参数与数据", "",
         f"- 语料：{report['document_count']} 篇、{report['chunk_count']} 个片段；语料指纹：`{report['corpus_sha256']}`。",
         f"- 黄金集：{'；'.join(f'`{name}` SHA-256 `{digest}`' for name, digest in report['golden_sha256'].items())}。",
@@ -447,7 +503,7 @@ def render_report(report: dict) -> str:
         "在仓库的 `rag-service/` 目录执行；需要本地 Ollama 已拉取 embedding 模型，且 `.env` 或 `config/llm.json` 配好回答模型。", "",
         "```powershell", "$env:PYTHONIOENCODING = 'utf-8'", report["command"], "```", "",
         "## 逐题明细", "",
-        "| 题号 | 类别 | 判定 | 状态 | 标注出处名次 | 引用名次 | 错源 | 支持/不支持 | 首字 ms | 完整 ms | 答案开头 |",
+        "| 题号 | 类别 | 判定 | 状态 | 标注出处名次 | 引用名次 | 错源 | 支持/不支持 | 最终首字总等待 ms | 整题总等待 ms | 答案开头 |",
         "|---|---|---|---|---:|---|---|---|---:|---:|---|",
     ]
     for result in report["results"]:
@@ -459,7 +515,17 @@ def render_report(report: dict) -> str:
             f"{','.join(map(str, result['cited_ranks'])) or '—'} | {wrong} | {support} | {_format_ms(result['first_text_ms'])} | "
             f"{_format_ms(result['total_ms'])} | {_cell(result['answer'][:60])} |"
         )
-    lines += ["", "候选与完整答案见同名 `.json`。", "", "## 环境与代码指纹", ""]
+    lines += ["", "## 逐次尝试", "",
+              "| 题号 | 尝试 | 结果 | 执行 ms | 本次首字 ms | 模型调用 | 后续退避 ms |",
+              "|---|---:|---|---:|---:|---:|---:|"]
+    for result in report["results"]:
+        for attempt in result["attempt_history"]:
+            lines.append(
+                f"| {result['question_id']} | {attempt['attempt']} | {attempt['failure'] or attempt['status'] or '—'} | "
+                f"{_format_ms(attempt['elapsed_ms'])} | {_format_ms(attempt['first_text_ms'])} | "
+                f"{attempt['model_calls']} | {_format_ms(attempt['backoff_ms'])} |"
+            )
+    lines += ["", "候选、完整答案和逐次分段耗时见同名 `.json`。", "", "## 环境与代码指纹", ""]
     lines.extend(f"- {package}: `{installed}`" for package, installed in report["versions"].items())
     lines.append("")
     lines.extend(f"- `{source}` SHA-256: `{digest}`" for source, digest in report["code_sha256"].items())
