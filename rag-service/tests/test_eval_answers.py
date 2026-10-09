@@ -15,7 +15,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from app.modules.qa.public import Qa
 from app.modules.retrieval.public import Chunk
 from scripts.eval_answers import (
-    EvaluationChunk, Question, QuestionResult, cited_ranks, evaluate_question, render_report, split_sentences,
+    EvaluationChunk, Question, QuestionResult, check_faithfulness, cited_ranks, evaluate_question, render_report, split_sentences,
     summarize,
 )
 from scripts.eval_retrieval import IndexedChunk
@@ -141,6 +141,42 @@ def test_invalid_citations_are_a_failure_with_the_partial_answer_kept():
     assert result.supported is None and result.wrong_source is None
 
 
+@pytest.mark.parametrize("answer,evidence,supported", [
+    ("基于提供的资料，Redis 默认端口为 9999 [1]。", "Redis 默认端口为 6379。", False),
+    ("以上回答严格基于片段，但 Redis 默认端口为 9999 [1]。", "Redis 默认端口为 6379。", False),
+    ("Redis 默认端口为 9999，以上回答严格基于片段 [1]。", "Redis 默认端口为 6379。", False),
+    ("覆盖边界说明：Redis 默认端口为 9999 [1]。", "Redis 默认端口为 6379。", False),
+    ("无法确定超时时间，但 Redis 默认端口为 9999 [1]。", "Redis 默认端口为 6379。", False),
+    ("资料未提及超时时间，Redis 默认端口为 9999 [1]。", "Redis 默认端口为 6379。", False),
+    ("Redis 事务未包含回滚功能 [1]。", "Redis 事务不支持回滚。", True),
+    ("覆盖边界说明：库中只有这些内容 [1]。", "Redis 默认端口为 6379。", False),
+    ("Redis 默认端口为 6379 [1]。", "Redis 默认端口为 6379。", True),
+])
+def test_faithfulness_checks_facts_even_with_boundary_or_negative_wording(answer, evidence, supported):
+    result = QuestionResult("Q1", "Q", "Redis？", "redis.md", answer=answer)
+    session = _ScriptedSession(json.dumps({"supported": supported}))
+    check_faithfulness(result, session, {1: evidence})
+    assert len(session.prompts) == 1, 'a cited factual claim was silently excluded'
+    assert answer in session.prompts[0][1] and evidence in session.prompts[0][1]
+    assert (result.meta_sentences, result.support_calls, result.support_invalid) == (0, 1, 0)
+    assert (result.supported, result.unsupported) == (int(supported), int(not supported))
+
+
+@pytest.mark.parametrize("answer", [
+    "以上回答严格基于片段 [1]。",
+    "以上回答仅基于提供的资料 [1, 2]。",
+    "覆盖边界说明：无法回答该问题 [1]。",
+    "无法确定 [1]。",
+])
+def test_faithfulness_only_skips_recognized_complete_meta_sentences(answer):
+    result = QuestionResult("P1", "P", "边界？", None, answer=answer)
+    session = _ScriptedSession()
+    check_faithfulness(result, session, {1: "片段一", 2: "片段二"})
+    assert session.prompts == []
+    assert (result.meta_sentences, result.support_calls, result.supported, result.unsupported) == (1, 0, 0, 0)
+    assert summarize([result])["faithfulness"]["support_rate"] is None
+
+
 def test_faithfulness_counts_supported_unsupported_invalid_and_uncited_sentences(monkeypatch):
     from scripts import eval_answers
 
@@ -149,20 +185,27 @@ def test_faithfulness_counts_supported_unsupported_invalid_and_uncited_sentences
     answer = ("ACID 有四个特性 [2]。\n它们是原子性等 [2]。\n据说还有第五个特性 [2]。\n无引用的总结。\n"
               "覆盖边界说明：库中只有这些内容 [2]。\n以上回答严格基于片段 [2]。")
     session = _ScriptedSession('{"verdict": "SUFFICIENT"}', answer,
-                               '{"supported": true}', 'not json', RuntimeError("model down"), '{"supported": false}')
+                               '{"supported": true}', 'not json', RuntimeError("model down"), '{"supported": false}',
+                               '{"supported": false}')
     result = evaluate_question(Qa(), Question("Q2", "ACID？", "a.md"), _FixedRetrieval(HITS), session, 5, CHUNKS,
                                faithfulness=True, pause=0.5, cooldown=3.0, max_attempts=2)
-    assert (result.supported, result.unsupported, result.support_invalid) == (1, 1, 1)
-    assert result.unsupported_sentences == [{"sentence": "据说还有第五个特性 [2]。", "ranks": [2]}]
-    # the two boundary / meta sentences cite a fragment but make no claim: counted, never sent to the judge
-    assert result.support_calls == 3 and result.meta_sentences == 2
+    assert (result.supported, result.unsupported, result.support_invalid) == (1, 2, 1)
+    assert result.unsupported_sentences == [
+        {"sentence": "据说还有第五个特性 [2]。", "ranks": [2]},
+        {"sentence": "覆盖边界说明：库中只有这些内容 [2]。", "ranks": [2]},
+    ]
+    # A claim about the entire library's contents is not a pure disclaimer.
+    assert result.support_calls == 4 and result.meta_sentences == 1
     assert result.sentences == 6 and result.uncited_sentences == 1
     assert result.wrong_source is False
     # pause before the first check, pause between checks, and one cooldown for the failed attempt
-    assert sleeps == [0.5, 0.5, 0.5, 3.0]
+    assert sleeps == [0.5, 0.5, 0.5, 3.0, 0.5]
     support_prompt = session.prompts[2][1]
     assert "ACID 有四个特性 [2]。" in support_prompt and CHUNKS[1].indexed.chunk.text in support_prompt
     assert CHUNKS[2].indexed.chunk.text not in support_prompt
+    faith = summarize([result])["faithfulness"]
+    assert faith["checked_sentences"] == 3 and faith["support_rate"] == pytest.approx(1 / 3)
+    assert (faith["invalid"], faith["uncited_sentences"], faith["meta_sentences"]) == (1, 1, 1)
 
 
 def test_relevant_subset_is_recorded_and_summarised(monkeypatch):
@@ -219,6 +262,9 @@ def test_summary_and_report_expose_rates_without_absolute_paths():
     assert "| N（库外） | 1 | NONE | 1/1（100.0%） |" in report
     assert "错源率（已作答且有引用的 Q/R 中，引用片段全部不属于标注出处）：1/2（50.0%）；错源题：Q2。" in report
     assert "引用支持率：75.0%" in report and "| P1 | P | PARTIAL | generate:INVALID_CITATIONS |" in report
+    assert summary["faithfulness"]["metric_version"] == "cited_sentence_support_v2"
+    assert "cited_sentence_support_v2" in report and "分母为取得有效判官结果的带引用句" in report
+    assert "不能作为严格下界" in report
     assert re.search(r"[A-Za-z]:[/\\]", report) is None and "scripted" in report
 
 
@@ -292,6 +338,8 @@ def test_cli_builds_an_isolated_index_and_writes_markdown_and_json(evaluation_fi
     data = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))
     assert [result["question_id"] for result in data["results"]] == ["Q1", "N1"]
     assert data["results"][0]["cited_sources"] == ["alpha.md"] and data["results"][0]["wrong_source"] is False
+    assert data["summary"]["faithfulness"]["metric_version"] == "cited_sentence_support_v2"
+    assert data["summary"]["faithfulness"]["checked_sentences"] == 1
     assert data["summary"]["calls"] == {"question_calls": 3, "support_calls": 1, "retried_questions": 0,
                                         "unavailable_after_retries": 0}
     assert created and not created[0].exists()
