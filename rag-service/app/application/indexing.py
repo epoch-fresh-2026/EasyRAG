@@ -3,14 +3,14 @@
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, Timer
 
 from app.modules.knowledge.public import ChunkWrite, DocumentNotFound, IndexStateConflict, Knowledge
 from app.modules.retrieval.public import (
     IndexChunk, IndexWriteError, Retrieval, RetrievalUnavailable, index_representatives,
 )
 
-from .gate import Gate, Lease, Operation
+from .gate import Gate, Lease, Operation, State
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,11 @@ def _reason(stage, failure):
 class Indexer:
     def __init__(self, knowledge: Knowledge, retrieval: Retrieval, gate: Gate):
         self._knowledge, self._retrieval, self._gate = knowledge, retrieval, gate
+
+    @property
+    def ready_for_retry(self) -> bool:
+        # A scheduling hint only; run must still acquire its own lease.
+        return self._gate.state == State.READY
 
     def run(self, document_id: int, lease: Lease | None = None) -> IndexResult:
         if lease is None:
@@ -104,14 +109,53 @@ class IndexingQueue:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='knowledge-index')
         self._lock = Lock()
         self._accepting = True
+        self._pending: set[int] = set()
+        self._retry_timer: Timer | None = None
 
     def submit(self, document_id: int, lease: Lease | None = None) -> Future:
+        """Return the first attempt; BUSY unleased work remains owned by this queue."""
         with self._lock:
             if not self._accepting:
                 raise QueueClosed('indexing executor has stopped accepting tasks')
-            return self._executor.submit(self._indexer.run, document_id, lease)
+            return self._executor.submit(self._run, document_id, lease)
+
+    def _run(self, document_id: int, lease: Lease | None) -> IndexResult:
+        result = self._indexer.run(document_id, lease)
+        if lease is None and result.outcome == 'BUSY':
+            with self._lock:
+                if self._accepting:
+                    self._pending.add(document_id)
+                    self._schedule_retry()
+        return result
+
+    def _schedule_retry(self):
+        # Called with the queue lock held. Waiting never occupies the index worker,
+        # which may need to execute a later task holding the current mutation lease.
+        if self._retry_timer is None:
+            self._retry_timer = Timer(.25, self._retry_pending)
+            self._retry_timer.daemon = True
+            self._retry_timer.start()
+
+    def _retry_pending(self):
+        with self._lock:
+            self._retry_timer = None
+            if not self._accepting:
+                return
+            if self._indexer.ready_for_retry:
+                for document_id in self._pending:
+                    self._executor.submit(self._run, document_id, None)
+                self._pending.clear()
+            else:
+                # Recovery is still explicit; inspect only the in-memory gate.
+                self._schedule_retry()
 
     def close(self):
         with self._lock:
             self._accepting = False
+            timer, self._retry_timer = self._retry_timer, None
+            self._pending.clear()
+            if timer is not None:
+                timer.cancel()
+        if timer is not None:
+            timer.join()
         self._executor.shutdown(wait=True)

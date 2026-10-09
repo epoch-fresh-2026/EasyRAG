@@ -44,7 +44,9 @@
 
 标题优先取 frontmatter 的 `title`，再取正文第一个一级标题，最后取文件名；`tags` 来自支持的 frontmatter 标签数组。公开上传只产生 `source_type: "UPLOAD"`，没有 URL 抓取接口。
 
-以下 JSON 是字段示例，ID、时间、分数和 token 数以实际响应为准。上传成功只说明已保存为 `PENDING`，不表示索引完成；待恢复或门禁忙时资料可以保留在 `PENDING`。
+以下 JSON 是字段示例，ID、时间、分数和 token 数以实际响应为准。上传成功只说明已保存为 `PENDING`，不表示索引完成。
+
+查询、变更或恢复占用门禁时，上传仍可保存为 `PENDING`。队列保留遇到 `BUSY` 的任务，等待门禁回到 `READY` 后自动重新提交；等待不会占用索引工作线程，每次执行仍须取得变更许可。`RECOVERY_REQUIRED` 必须先手动确认就绪，不会因重试而自动放行。索引已进入 `FAILED` 的资料不自动重试。停机时取消尚未重投的内存任务、等待已提交任务退出；未处理资料仍保存在数据库，下次启动并确认就绪后重新提交。资料详情中的 `index_status` 是处理结果，上传响应不承诺完成时间。
 
 ```json
 {"id":7,"title":"Note","source_type":"UPLOAD","index_status":"PENDING"}
