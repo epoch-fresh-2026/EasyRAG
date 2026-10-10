@@ -13,6 +13,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
 from app.modules.qa.public import Qa
+from app.modules.answer_models.public import ModelUnavailable
 from app.modules.retrieval.public import Chunk
 from scripts.eval_answers import (
     EvaluationChunk, Question, QuestionResult, check_faithfulness, cited_ranks, evaluate_question, render_report, split_sentences,
@@ -53,6 +54,46 @@ class _FixedRetrieval:
             record_timing("embedding", 7.0)
             record_timing("vector", 1.0)
         return self.hits[:top_k]
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 100.0
+        self.sleeps = []
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    from app.modules.qa import public as qa_module
+    from scripts import eval_answers
+
+    clock = _Clock()
+    monkeypatch.setattr(eval_answers, "perf_counter", lambda: clock.now)
+    monkeypatch.setattr(qa_module, "perf_counter", lambda: clock.now)
+    monkeypatch.setattr(eval_answers.time, "sleep", clock.sleep)
+    return clock
+
+
+class _TimedSession(_ScriptedSession):
+    def __init__(self, clock, *calls):
+        super().__init__(*(reply for _, reply in calls))
+        self.clock = clock
+        self.delays = [seconds for seconds, _ in calls]
+
+    def complete(self, prompt):
+        self.clock.advance(self.delays.pop(0))
+        return super().complete(prompt)
+
+    def stream(self, prompt):
+        self.clock.advance(self.delays.pop(0))
+        yield from super().stream(prompt)
 
 
 class _Hit:
@@ -109,6 +150,127 @@ def test_model_unavailable_is_retried_with_cooldown_but_contract_failures_are_no
     result = evaluate_question(Qa(), Question("Q1", "什么是 ACID？", "a.md"), _FixedRetrieval(HITS), session, 5, CHUNKS,
                                faithfulness=False, cooldown=1.0, max_attempts=2)
     assert (result.attempts, result.failure) == (2, "judge:ModelUnavailable") and sleeps == [2.0, 4.0, 1.0]
+
+
+def test_retry_preserves_failed_attempt_and_counts_all_waiting(clock):
+    session = _TimedSession(clock, (5, ModelUnavailable()), (1, '{"verdict":"SUFFICIENT"}'), (1, "ACID [2]。"))
+    result = evaluate_question(Qa(), Question("Q1", "ACID?", "a.md"), _FixedRetrieval(HITS), session, 5, CHUNKS,
+                               faithfulness=False, cooldown=2, max_attempts=3)
+    assert result.total_ms == 9000
+    assert (result.last_attempt_ms, result.execution_ms, result.backoff_ms) == (2000, 7000, 2000)
+    assert result.first_text_ms == 9000 and result.model_calls == 3
+    first, second = result.attempt_history
+    assert (first["attempt"], first["failure"], first["status"], first["elapsed_ms"], first["model_calls"]) == (
+        1, "judge:ModelUnavailable", None, 5000, 1)
+    assert first["first_text_ms"] is None and first["backoff_ms"] == 2000
+    assert first["stage_ms"]["judge"] == 5000 and "generate" not in first["stage_ms"]
+    assert (second["attempt"], second["failure"], second["status"], second["elapsed_ms"], second["model_calls"]) == (
+        2, None, "ANSWERED", 2000, 2)
+    assert second["first_text_ms"] == 2000 and second["backoff_ms"] == 0
+    assert second["stage_ms"]["judge"] == 1000 and second["stage_ms"]["generate"] == 1000
+    assert result.stage_ms == second["stage_ms"] and clock.sleeps == [2]
+
+
+@pytest.mark.parametrize("calls,status,failure,elapsed,backoff,attempts", [
+    ([(1, '{"verdict":"SUFFICIENT"}'), (1, "ACID [2]。")], "ANSWERED", None, 2000, 0, 1),
+    ([(1, '{"verdict":"NONE"}')], "REFUSED", None, 1000, 0, 1),
+    ([(5, ModelUnavailable()), (3, ModelUnavailable())], None, "judge:ModelUnavailable", 8000, 2000, 2),
+    ([(1, '{"verdict":"SUFFICIENT"}'), (1, "没有引用。")], None, "generate:INVALID_CITATIONS", 2000, 0, 1),
+])
+def test_attempt_accounting_covers_success_refusal_exhaustion_and_contract_failure(
+        clock, calls, status, failure, elapsed, backoff, attempts):
+    session = _TimedSession(clock, *calls)
+    result = evaluate_question(Qa(), Question("Q1", "ACID?", "a.md"), _FixedRetrieval(HITS), session, 5, CHUNKS,
+                               faithfulness=False, cooldown=2, max_attempts=2)
+    assert (result.status, result.failure, result.attempts) == (status, failure, attempts)
+    assert result.total_ms == elapsed + backoff
+    assert result.execution_ms == elapsed and result.backoff_ms == backoff
+    assert len(result.attempt_history) == attempts
+    assert result.last_attempt_ms == result.attempt_history[-1]["elapsed_ms"]
+    assert sum(attempt["model_calls"] for attempt in result.attempt_history) == len(session.prompts)
+    assert result.model_calls == len(session.prompts)
+    assert clock.sleeps == ([2] if attempts == 2 else [])
+
+
+def test_retry_uses_final_attempt_text_without_losing_earlier_first_text(clock):
+    class PartialFailure(_ScriptedSession):
+        def complete(self, prompt):
+            self.prompts.append(("complete", prompt))
+            clock.advance(1)
+            return '{"verdict":"SUFFICIENT"}'
+
+        def stream(self, prompt):
+            self.prompts.append(("stream", prompt))
+            clock.advance(1)
+            if len(self.prompts) == 2:
+                yield "失败尝试的文本 [2]。"
+                clock.advance(2)
+                raise ModelUnavailable()
+            yield "最终回答 [2]。"
+
+    result = evaluate_question(Qa(), Question("Q1", "ACID?", "a.md"), _FixedRetrieval(HITS), PartialFailure(),
+                               5, CHUNKS, faithfulness=False, cooldown=2, max_attempts=2)
+    assert result.answer == "最终回答 [2]。"
+    assert result.total_ms == 8000 and result.first_text_ms == 8000
+    assert [attempt["first_text_ms"] for attempt in result.attempt_history] == [2000, 2000]
+    assert [attempt["failure"] for attempt in result.attempt_history] == ["generate:ModelUnavailable", None]
+
+
+def test_question_timing_excludes_later_faithfulness_work(clock):
+    session = _TimedSession(clock, (1, '{"verdict":"SUFFICIENT"}'), (1, "ACID [2]。"),
+                            (3, ModelUnavailable()), (4, '{"supported":true}'))
+    result = evaluate_question(Qa(), Question("Q1", "ACID?", "a.md"), _FixedRetrieval(HITS), session, 5, CHUNKS,
+                               faithfulness=True, pause=.5, cooldown=2, max_attempts=2)
+    assert result.total_ms == 2000 and result.first_text_ms == 2000
+    assert (result.support_sentences, result.support_calls, result.model_calls) == (1, 2, 2)
+    assert clock.now == 111.5 and clock.sleeps == [.5, 2]
+
+
+def test_backoff_records_actual_wait_including_scheduler_delay(clock, monkeypatch):
+    from scripts import eval_answers
+
+    monkeypatch.setattr(eval_answers.time, "sleep", lambda seconds: clock.advance(seconds + .25))
+    session = _TimedSession(clock, (5, ModelUnavailable()), (2, '{"verdict":"NONE"}'))
+    result = evaluate_question(Qa(), Question("Q1", "ACID?", "a.md"), _FixedRetrieval(HITS), session, 5, CHUNKS,
+                               faithfulness=False, cooldown=2, max_attempts=2)
+    assert result.total_ms == 9250 and result.backoff_ms == 2250
+    assert result.execution_ms == 7000 and result.attempt_history[0]["backoff_ms"] == 2250
+
+
+@pytest.mark.parametrize("replies,calls,invalid", [
+    ([ModelUnavailable(), '{"supported":true}'], 2, 0),
+    ([ModelUnavailable(), ModelUnavailable(), ModelUnavailable()], 3, 1),
+    (["not json"], 1, 1),
+])
+def test_support_counts_actual_attempts_separately_from_sentences(clock, replies, calls, invalid):
+    result = QuestionResult("Q1", "Q", "ACID?", "a.md", answer="ACID 有四个特性 [1]。")
+    session = _ScriptedSession(*replies)
+    check_faithfulness(result, session, {1: CHUNKS[1].indexed.chunk.text}, cooldown=2, max_attempts=3)
+    assert result.support_calls == calls == len(session.prompts)
+    assert result.support_sentences == 1 and result.support_invalid == invalid
+    assert clock.sleeps == ([2 * attempt for attempt in range(1, calls)])
+
+
+def test_summary_separates_first_attempt_and_eventual_technical_success(clock):
+    results = []
+    for calls in (
+        [(1, '{"verdict":"NONE"}')],
+        [(5, ModelUnavailable()), (1, '{"verdict":"SUFFICIENT"}'), (1, "ACID [2]。")],
+        [(5, ModelUnavailable()), (3, ModelUnavailable())],
+    ):
+        results.append(evaluate_question(Qa(), Question("Q1", "ACID?", "a.md"), _FixedRetrieval(HITS),
+                                         _TimedSession(clock, *calls), 5, CHUNKS, faithfulness=False,
+                                         cooldown=2, max_attempts=2))
+    summary = summarize(results)
+    assert summary["retry_accounting_version"] == "retry_accounting_v2"
+    assert summary["completion"] == {
+        "attempted_questions": 3, "first_attempt_successes": 1, "eventual_successes": 2,
+        "first_attempt_success_rate": pytest.approx(1 / 3), "eventual_success_rate": pytest.approx(2 / 3),
+    }
+    assert summary["latency_ms"]["total_median"] == 9000
+    assert summary["latency_ms"]["last_attempt_median"] == 2000
+    assert summary["latency_ms"]["execution_median"] == 7000
+    assert summary["latency_ms"]["backoff_median"] == 2000
 
 
 def test_refusal_records_one_call_and_no_first_text():
@@ -195,7 +357,7 @@ def test_faithfulness_counts_supported_unsupported_invalid_and_uncited_sentences
         {"sentence": "覆盖边界说明：库中只有这些内容 [2]。", "ranks": [2]},
     ]
     # A claim about the entire library's contents is not a pure disclaimer.
-    assert result.support_calls == 4 and result.meta_sentences == 1
+    assert result.support_calls == 5 and result.support_sentences == 4 and result.meta_sentences == 1
     assert result.sentences == 6 and result.uncited_sentences == 1
     assert result.wrong_source is False
     # pause before the first check, pause between checks, and one cooldown for the failed attempt
@@ -230,13 +392,21 @@ def test_summary_and_report_expose_rates_without_absolute_paths():
                               cited_ranks=[1], cited_sources=["a.md"], wrong_source=False, first_text_ms=900.0,
                               total_ms=4000.0, stage_ms={"judge": 400.0, "generate": 3000.0}, model_calls=2,
                               generate_prompt_chars=800, sentences=3, uncited_sentences=1, supported=2,
-                              unsupported=0, support_invalid=0, support_calls=2)
+                              unsupported=0, support_invalid=0, support_calls=2, support_sentences=2)
     wrong = QuestionResult("Q2", "Q", "q", "b.md", decision="PARTIAL", status="PARTIAL", expected_rank=None,
                            cited_ranks=[2], cited_sources=["c.md"], wrong_source=True, first_text_ms=1200.0,
-                           total_ms=5000.0, model_calls=2, supported=1, unsupported=1, support_invalid=0, support_calls=2)
+                           total_ms=5000.0, model_calls=2, supported=1, unsupported=1, support_invalid=0,
+                           support_calls=2, support_sentences=2)
     refused = QuestionResult("N1", "N", "q", None, decision="NONE", status="REFUSED", total_ms=1500.0, model_calls=1)
     failed = QuestionResult("P1", "P", "q", None, decision="PARTIAL", failure="generate:INVALID_CITATIONS",
                             total_ms=6000.0, model_calls=2)
+    for result in (answered, wrong, refused, failed):
+        result.last_attempt_ms = result.execution_ms = result.total_ms
+        result.attempt_history = [{
+            "attempt": 1, "status": result.status, "failure": result.failure, "decision": result.decision,
+            "elapsed_ms": result.total_ms, "first_text_ms": result.first_text_ms,
+            "model_calls": result.model_calls, "stage_ms": result.stage_ms, "backoff_ms": 0,
+        }]
     summary = summarize([answered, wrong, refused, failed])
     assert summary["categories"]["Q"]["expected_decisions"] == 2 and summary["categories"]["N"]["expected_decisions"] == 1
     assert summary["categories"]["P"] == {"total": 1, "decisions": {"PARTIAL": 1},
@@ -245,7 +415,8 @@ def test_summary_and_report_expose_rates_without_absolute_paths():
                                   "wrong_source_ids": ["Q2"], "missing_expected_ids": ["Q2"]}
     assert summary["faithfulness"]["support_rate"] == 0.75 and summary["faithfulness"]["unsupported_ids"] == ["Q2"]
     assert summary["latency_ms"]["first_text_median"] == 1050.0 and summary["latency_ms"]["refusal_total_median"] == 1500.0
-    assert summary["calls"] == {"question_calls": 7, "support_calls": 4, "retried_questions": 0, "unavailable_after_retries": 0}
+    assert summary["calls"] == {"question_calls": 7, "support_calls": 4, "support_sentences": 4,
+                                "retried_questions": 0, "unavailable_after_retries": 0}
     assert summary["evidence"] == {"answers": 0, "candidates": 0, "relevant": 0, "subset_answers": 0, "expected_dropped_ids": []}
     report = render_report({
         "generated_at": "2026-09-21T00:00:00+08:00",
@@ -265,6 +436,10 @@ def test_summary_and_report_expose_rates_without_absolute_paths():
     assert summary["faithfulness"]["metric_version"] == "cited_sentence_support_v2"
     assert "cited_sentence_support_v2" in report and "分母为取得有效判官结果的带引用句" in report
     assert "不能作为严格下界" in report
+    assert "retry_accounting_v2" in report and "累计执行" in report and "实际退避" in report
+    assert "首次技术成功：3/4（75.0%）" in report and "最终技术成功：3/4（75.0%）" in report
+    assert "| Q1 | 1 | ANSWERED | 4000 | 900 | 2 | 0 |" in report
+    assert "不含会话创建、逐句支持核对、题间停顿、产品 HTTP 入口、历史写库与浏览器渲染" in report
     assert re.search(r"[A-Za-z]:[/\\]", report) is None and "scripted" in report
 
 
@@ -340,8 +515,14 @@ def test_cli_builds_an_isolated_index_and_writes_markdown_and_json(evaluation_fi
     assert data["results"][0]["cited_sources"] == ["alpha.md"] and data["results"][0]["wrong_source"] is False
     assert data["summary"]["faithfulness"]["metric_version"] == "cited_sentence_support_v2"
     assert data["summary"]["faithfulness"]["checked_sentences"] == 1
-    assert data["summary"]["calls"] == {"question_calls": 3, "support_calls": 1, "retried_questions": 0,
+    assert data["summary"]["calls"] == {"question_calls": 3, "support_calls": 1, "support_sentences": 1, "retried_questions": 0,
                                         "unavailable_after_retries": 0}
+    assert data["summary"]["retry_accounting_version"] == "retry_accounting_v2"
+    assert data["summary"]["completion"]["first_attempt_success_rate"] == 1
+    first = data["results"][0]
+    assert first["last_attempt_ms"] == first["execution_ms"] == first["attempt_history"][0]["elapsed_ms"]
+    assert first["total_ms"] >= first["execution_ms"] and first["backoff_ms"] == 0
+    assert first["attempt_history"][0]["model_calls"] == first["model_calls"] == 2
     assert created and not created[0].exists()
     assert sum(len(batch) for batch in embed_requests) == 2 + 2
     assert "wrong source: 0/1" in capsys.readouterr().out
