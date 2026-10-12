@@ -1,6 +1,6 @@
 # 子 Issue G：FastAPI 接入、应用编排与恢复
 
-Issue：[#36](https://github.com/vansye/EasyRAG/issues/36)，父 Issue：#1。架构：[模块与数据流](架构设计.md)。位置：`app/application`、FastAPI 入口与维护 CLI。
+Issue：[#36](https://github.com/epoch-fresh-2026/EasyRAG/issues/36)，父 Issue：#1。架构：[模块与数据流](架构设计.md)。位置：`app/application`、FastAPI 入口与维护 CLI。
 
 ## 职责
 
