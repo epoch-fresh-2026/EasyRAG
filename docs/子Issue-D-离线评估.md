@@ -1,6 +1,6 @@
 # 子 Issue D：检索与问答评估
 
-Issue：[#37](https://github.com/vansye/EasyRAG/issues/37)，父 Issue：#1。架构：[模块与数据流](架构设计.md)。D 维护离线召回与在线问答评估，不建设评估数据库或网页看板。
+Issue：[#37](https://github.com/epoch-fresh-2026/EasyRAG/issues/37)，父 Issue：#1。架构：[模块与数据流](架构设计.md)。D 维护离线召回与在线问答评估，不建设评估数据库或网页看板。
 
 ## 功能与数据原型
 

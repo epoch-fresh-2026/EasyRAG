@@ -1,6 +1,6 @@
 # 子 Issue E：前端知识工作台
 
-对应 [#33](https://github.com/vansye/EasyRAG/issues/33)，父 Issue [#1](https://github.com/vansye/EasyRAG/issues/1)。前端使用 Vue 3、TypeScript、Pinia 与 Vite，通过 G 的 FastAPI 接口工作。启动和测试命令见 [前端 README](../frontend/README.md)。
+对应 [#33](https://github.com/epoch-fresh-2026/EasyRAG/issues/33)，父 Issue [#1](https://github.com/epoch-fresh-2026/EasyRAG/issues/1)。前端使用 Vue 3、TypeScript、Pinia 与 Vite，通过 G 的 FastAPI 接口工作。启动和测试命令见 [前端 README](../frontend/README.md)。
 
 ## 一、职责与页面
 

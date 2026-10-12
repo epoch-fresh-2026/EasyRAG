@@ -1,6 +1,8 @@
 # EasyRAG
 
-个人知识库问答系统：收录 Markdown / TXT，管理和编辑资料，基于知识库回答并展示出处与检索过程。资料更新、重索引或删除后，问答使用当前内容；依据不足时明确拒答。Vue 工作台支持在网页配置 OpenAI 兼容接口、DeepSeek 或本地 Ollama 回答模型。问答历史保存在服务端，可查看、删除和重新提问；历史出处保留回答时的原文。
+个人知识库问答系统：收录 Markdown / TXT，管理和编辑资料，基于检索片段生成回答、部分回答或拒答，并展示出处与检索过程。资料索引变更与问答互斥，更新完成后新问答使用新索引。Vue 工作台支持在网页配置 OpenAI 兼容接口、DeepSeek 或本地 Ollama 回答模型。问答历史保存在服务端，可查看、删除和重新提问；历史出处保留回答时的原文。
+
+无候选或模型判定 NONE 时，程序直接拒答；有候选时，证据是否充分由模型判断，仍可能误判或生成不受来源支持的内容。引用校验检查编号，不保证答案正确。当前限制见[已知缺口与验收条件](docs/总功能文档-Issue.md#十已知缺口与验收条件)。
 
 ## 架构
 
@@ -69,7 +71,9 @@ cd ..\rag-service
 
 `.env` 里填好 MySQL 连接（`MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`，库名默认 `easyrag`）；配置不入库。回答模型可以写在 `.env`，也可以启动后在网页里配置。Linux/macOS 使用 `.venv/bin/python` 和 `cp .env.example .env`。
 
-打开 `http://127.0.0.1:8080/`，点击「确认就绪」。后端启动时是 `RECOVERY_REQUIRED`；只有资料/切片/向量完整一致才开放问答，并重新提交 PENDING。
+打开 `http://127.0.0.1:8080/`，点击「确认就绪」。后端启动时是 `RECOVERY_REQUIRED`；资料/切片/向量核验通过后才开放问答，并重新提交 PENDING。
+
+繁忙时已接收的上传先保持 PENDING，后台队列在门禁回到 READY 后重试；若门禁为 RECOVERY_REQUIRED，仍须显式确认就绪。重启后也通过就绪流程重新提交持久化的 PENDING，不依赖页面轮询触发处理。
 
 启动时后端会：
 - 在库不存在时创建数据库（utf8mb4），空库建表，已有库升级到当前结构；数据库用户需要相应权限。旧版 Java/Flyway V2 数据库不会被自动改动，需停服后先运行 `python -m app.maintenance adopt-legacy-db`（见下方维护与故障恢复）。
@@ -128,6 +132,8 @@ cd rag-service
 
 集成测试只创建并删除 `easyrag_fastapi_it_<随机UUID>`，不选择业务数据库；使用临时 Chroma、tokenizer 和本地 HTTP 模型服务，不需要真实模型或付费请求。数据库初始化、旧库接管与升级、事务、UTF-8 偏移、历史快照、索引恢复、HTTP 与维护子进程均有覆盖。CI 在 Linux 上运行同一批测试，并保留 Vue 测试与构建。
 
+默认 `pytest -q` 不收集上述 `mysql_*_integration.py`，必须单独执行。单元测试验证受控分支；MySQL 集成测试验证真实存储与跨模块行为，模型响应仍是替身；浏览器接口样例验证页面交互；真实模型报告评估指定语料上的输出。某一层通过不能替代其他层，也不能证明未覆盖输入、全新安装或当前运行进程已经验收。
+
 问答质量用两个脚本度量，都只用 `sample-knowledge/` 与 `docs/eval/` 的黄金集在临时目录建隔离索引，不碰业务数据：
 
 ```powershell
@@ -138,9 +144,9 @@ cd rag-service
 .\.venv\Scripts\python.exe -m scripts.eval_answers --faithfulness --output ../docs/eval/answers.md
 ```
 
-`eval_answers` 默认跑 v1 + v2 全部 42 题，`--golden-set ../docs/eval/golden-set-v3-hard.md` 可换成难例集，`--only N,P` 或 `--only Q21,N8` 可只跑部分；`--faithfulness` 逐句核对引用是否被片段支持，会多出约一倍调用。报告与同名 JSON 记录本次样本数字与调用次数，口径见 [子 Issue D](docs/子Issue-D-离线评估.md)。
+`eval_answers` 默认跑 v1 + v2 全部 42 题，`--golden-set ../docs/eval/golden-set-v3-hard.md` 可换成难例集，`--only N,P` 或 `--only Q21,N8` 可只跑部分；`--faithfulness` 对符合核对条件的带引用句调用模型，额外调用量随句数、失败和重试变化。报告与同名 JSON 分别记录核对句数、实际调用次数和重试耗时，定义见[评估口径](docs/评估检索质量.md)。v2 已参与调试，不能继续当作未见留出集。
 
-真实使用里的失败问法是最好的难例来源。`python -m scripts.export_history_failures` 只读地把本机问答历史中状态为 REFUSED / PARTIAL 的记录导出为 `rag-service/data/` 下的 JSON 与标注表（问题、当时候选与判定，不含答案正文），由人工填写"期望出处"后再决定哪些进入黄金集；该目录被 Git 忽略，真实问法不入库。
+真实使用记录可用于发现难例。`python -m scripts.export_history_failures` 默认只读导出 REFUSED / PARTIAL；加 `--status ANSWERED` 可抽查自信答错，系统状态本身不代表对错。输出为 `rag-service/data/` 下的 JSON 与标注表（问题、当时候选与判定，不含答案正文），需结合本机历史原答案人工核验；该目录被 Git 忽略，真实问法不入库。
 
 ```powershell
 cd frontend
@@ -168,4 +174,4 @@ node tests/browser-regressions.mjs
 - [问答工作流与边界](docs/问答工作流与边界.md)
 - [检索质量评估](docs/评估检索质量.md)与 [评估报告](docs/eval/)
 
-当前没有查询改写重查、工具自主调用、分类树或网页评估看板。V2 将研究统计与目录如何作为上下文交给模型汇总；具体编排方式尚未实现。
+当前没有查询改写重查、工具自主调用、分类树或网页评估看板。网页收录暂不考虑；若以后实现，应独立于资料库且不参与检索。V2 已延期，统计与目录上下文只是待研究方向，不属于当前交付承诺。
